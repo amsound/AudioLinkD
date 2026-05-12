@@ -4,6 +4,7 @@ use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},
     HeapRb,
 };
+use rubato::{FastFixedIn, PolynomialDegree, Resampler};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::net::UdpSocket;
@@ -127,11 +128,11 @@ fn rtp_header(ssrc: u32) -> Vec<u8> {
     pkt
 }
 
-fn build_probe_packet(my_token: &[u8; 16], shared_token: &[u8; 16]) -> Vec<u8> {
+fn build_probe_packet(device_name_token: &[u8; 16], shared_token: &[u8; 16]) -> Vec<u8> {
     let mut pkt = rtp_header(SSRC_CONTROL);
     pkt.extend_from_slice(&[0x09, 0x07]);
     pkt.extend_from_slice(&[0x00; 7]);
-    pkt.extend_from_slice(my_token);
+    pkt.extend_from_slice(device_name_token);
     pkt.extend_from_slice(shared_token);
     pkt
 }
@@ -151,6 +152,32 @@ fn build_confirm_packet(shared_token: &[u8; 16]) -> Vec<u8> {
     pkt.extend_from_slice(shared_token);
     pkt.extend_from_slice(shared_token);
     pkt
+}
+
+/// 09 0b — RTT Ping. Carries a u64 microsecond send timestamp.
+/// Receiver echoes it back unchanged as a 09 0c Pong.
+fn build_rtt_ping(timestamp_us: u64) -> Vec<u8> {
+    let mut pkt = rtp_header(SSRC_CONTROL);
+    pkt.extend_from_slice(&[0x09, 0x0b]);
+    pkt.extend_from_slice(&[0x00; 7]);
+    pkt.extend_from_slice(&timestamp_us.to_be_bytes());
+    pkt
+}
+
+/// 09 0c — RTT Pong. Echoes the timestamp from the ping unchanged.
+fn build_rtt_pong(timestamp_us: u64) -> Vec<u8> {
+    let mut pkt = rtp_header(SSRC_CONTROL);
+    pkt.extend_from_slice(&[0x09, 0x0c]);
+    pkt.extend_from_slice(&[0x00; 7]);
+    pkt.extend_from_slice(&timestamp_us.to_be_bytes());
+    pkt
+}
+
+fn now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 fn json_escape(value: &str) -> String {
@@ -188,7 +215,7 @@ fn default_node_id() -> String {
 }
 
 fn build_metadata_packet_with_labels(
-    my_token: &[u8; 16],
+    device_name_token: &[u8; 16],
     num_channels: usize,
     node_id: &str,
     labels: &[String],
@@ -213,14 +240,14 @@ fn build_metadata_packet_with_labels(
     pkt.push(((len24 >> 16) & 0xff) as u8);
     pkt.push(((len24 >> 8) & 0xff) as u8);
     pkt.push((len24 & 0xff) as u8);
-    pkt.extend_from_slice(my_token);
+    pkt.extend_from_slice(device_name_token);
     pkt.extend_from_slice(json_bytes);
     pkt
 }
 
-fn build_metadata_packet(my_token: &[u8; 16], num_channels: usize, node_id: &str) -> Vec<u8> {
+fn build_metadata_packet(device_name_token: &[u8; 16], num_channels: usize, node_id: &str) -> Vec<u8> {
     let labels: Vec<String> = (0..num_channels).map(local_channel_label).collect();
-    build_metadata_packet_with_labels(my_token, num_channels, node_id, &labels)
+    build_metadata_packet_with_labels(device_name_token, num_channels, node_id, &labels)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -238,10 +265,12 @@ impl RemoteMetadata {
 
 #[derive(Debug)]
 enum HandshakePacket {
-    Probe { expected_peer: [u8; 16] },
+    Probe { sender_token: [u8; 16], expected_peer: [u8; 16] },
     Accept { token: [u8; 16] },
     Confirm { token: [u8; 16] },
     Metadata(RemoteMetadata),
+    RttPing { timestamp_us: u64 },
+    RttPong { timestamp_us: u64 },
 }
 
 fn be_u32_at(data: &[u8], offset: usize) -> Option<u32> {
@@ -321,8 +350,11 @@ fn parse_handshake_packet(data: &[u8]) -> Option<HandshakePacket> {
 
     match (ssrc, kind) {
         (SSRC_CONTROL, [0x09, 0x07]) if data.len() >= 53 => {
-            // Probe body: 7 reserved bytes, sender token, expected peer/shared token.
-            Some(HandshakePacket::Probe { expected_peer: copy_token(data, 37)? })
+            // Probe body: 7 reserved bytes, sender token (offset 21), shared/expected token (offset 37).
+            Some(HandshakePacket::Probe {
+                sender_token: copy_token(data, 21)?,
+                expected_peer: copy_token(data, 37)?,
+            })
         }
         (SSRC_CONTROL, [0x09, 0x09]) if data.len() >= 37 => {
             Some(HandshakePacket::Accept { token: copy_token(data, 21)? })
@@ -343,7 +375,34 @@ fn parse_handshake_packet(data: &[u8]) -> Option<HandshakePacket> {
             let metadata = parse_channel_metadata(json);
             Some(HandshakePacket::Metadata(metadata))
         }
+        // 09 0b — RTT Ping: 7 reserved bytes then u64 timestamp.
+        (SSRC_CONTROL, [0x09, 0x0b]) if data.len() >= 29 => {
+            let ts = u64::from_be_bytes(data.get(21..29)?.try_into().ok()?);
+            Some(HandshakePacket::RttPing { timestamp_us: ts })
+        }
+        // 09 0c — RTT Pong: echoed timestamp.
+        (SSRC_CONTROL, [0x09, 0x0c]) if data.len() >= 29 => {
+            let ts = u64::from_be_bytes(data.get(21..29)?.try_into().ok()?);
+            Some(HandshakePacket::RttPong { timestamp_us: ts })
+        }
         _ => None,
+    }
+}
+
+/// Derive the shared link token from both device names and an optional password.
+/// Both sides sort the names alphabetically before hashing, so the token is
+/// identical regardless of which side is initiator and which is responder.
+/// Neither the names nor the password are transmitted — both sides derive locally.
+/// Reserved as key material for future AES-256-GCM transport encryption.
+fn derive_link_token(my_device_name: &str, remote_device_name: &str, link_password: Option<&str>) -> [u8; 16] {
+    let (a, b) = if my_device_name <= remote_device_name {
+        (my_device_name, remote_device_name)
+    } else {
+        (remote_device_name, my_device_name)
+    };
+    match link_password.filter(|p| !p.is_empty()) {
+        Some(pw) => derive_token_from_text(&format!("{a}:{b}:{pw}")),
+        None      => derive_token_from_text(&format!("{a}:{b}")),
     }
 }
 
@@ -577,43 +636,22 @@ fn decode_or_plc(decoder: &mut opus::Decoder, payload: Option<&[u8]>, pcm: &mut 
     }
 }
 
-fn write_decoded_to_rings(
-    decoded: &[Vec<f32>],
-    pb_prods: &mut [impl Producer<Item = f32>],
-    active_channels: usize,
-) {
-    let active = active_channels.max(1).min(MAX_CHANNELS);
-    for ch in 0..active {
-        for &s in decoded[ch].iter() {
-            pb_prods[ch].try_push(s).ok();
-        }
-    }
-}
-
 fn drain_phase_locked_groups(
     groups: &mut BTreeMap<u32, FrameGroup>,
     decoders: &mut [opus::Decoder],
-    pb_prods: &mut [impl Producer<Item = f32>],
     remote_channels: usize,
     decoded: &mut [Vec<f32>],
     pcm: &mut [f32],
+    on_group: &mut dyn FnMut(&[Vec<f32>], usize),
 ) -> (usize, usize) {
     let active = remote_channels.min(MAX_CHANNELS);
     if active == 0 {
         return (0, 0);
     }
 
-    // Important M6 detail: timestamp groups are for channel phase alignment, not
-    // for storing the whole playout latency. The playout latency lives in the
-    // per-channel playback rings. Holding groups for target_delay_ms caused the
-    // packet queue to grow while the playback rings stayed nearly empty, which
-    // produced exactly the glitchy "first seconds OK, then awful" behaviour.
-    //
     // Drain strictly oldest-first. A complete oldest group is ready immediately.
     // An incomplete oldest group becomes ready after the 10ms phase-lock timeout
-    // and missing/corrupt channels are generated with Opus PLC. Newer groups are
-    // never released ahead of an older group, so channel phase and timestamp
-    // ordering stay locked.
+    // and missing/corrupt channels are generated with Opus PLC.
     let mut output_groups = 0usize;
     let mut plc_channels = 0usize;
 
@@ -635,7 +673,7 @@ fn drain_phase_locked_groups(
             }
             decoded[ch].copy_from_slice(pcm);
         }
-        write_decoded_to_rings(decoded, pb_prods, active);
+        on_group(decoded, active);
         output_groups += 1;
     }
 
@@ -704,6 +742,8 @@ struct Route {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct PersistedRuntimeConfig {
     remote: Option<String>,
+    remote_device_name: Option<String>,
+    link_password: Option<String>,
     node_id: Option<String>,
     token_hex: Option<String>,
     channels: Option<usize>,
@@ -711,6 +751,7 @@ struct PersistedRuntimeConfig {
     latency_ms: Option<u32>,
     fixed_jitter: Option<bool>,
     phase_lock: Option<bool>,
+    channel_labels: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -763,7 +804,11 @@ fn save_persisted_routes(routes: &[Route]) {
 
 fn save_persisted_config(config: PersistedRuntimeConfig) {
     let mut state = load_persisted_state();
+    // Preserve channel labels — they are saved separately via local_labels_post_handler
+    // and must not be wiped when the engine rebuilds due to a setup change.
+    let preserved_labels = state.config.channel_labels.clone();
     state.config = config;
+    state.config.channel_labels = preserved_labels;
     save_persisted_state(&state);
 }
 
@@ -785,6 +830,22 @@ fn load_persisted_routes(local_inputs: usize, send_channels: usize) -> Vec<Route
         .routes
         .into_iter()
         .filter(|r| route_valid_for_runtime(r, local_inputs, send_channels))
+        .collect()
+}
+
+/// Load channel labels from persisted config, merging with defaults for any
+/// channels beyond what was saved. This preserves names across engine restarts
+/// and when the channel count increases. Reducing channels simply stops at the
+/// new count — names of removed channels are discarded as expected.
+fn load_persisted_labels(num_channels: usize) -> Vec<String> {
+    let saved = load_persisted_state().config.channel_labels.unwrap_or_default();
+    (0..num_channels)
+        .map(|ch| {
+            saved.get(ch)
+                .filter(|l| !l.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| local_channel_label(ch))
+        })
         .collect()
 }
 
@@ -818,12 +879,16 @@ struct UiStats {
     input_peak_dbfs: Vec<f32>,
     rx_peak_dbfs: Vec<f32>,
     monitor_peak_dbfs: [f32; 2],
+    rtt_ms: f64,
+    one_way_latency_ms: f64,
+    ring_overflows: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct RuntimeSummary {
     mode: String,
-    peer: String,
+    remote_host: String,
+    remote_device_name: String,
     source: String,
     codec: String,
     opus_bitrate_per_channel: u32,
@@ -839,6 +904,7 @@ struct RuntimeSummary {
     effective_latency_ms: u32,
     fixed_jitter: bool,
     phase_lock: bool,
+    link_password_configured: bool,
     web_note: String,
 }
 
@@ -952,12 +1018,11 @@ struct WebState {
     monitor_mode: Arc<AtomicU8>,
     // Two physical stereo outputs, each represented by a 64-bit mask of network receive channels.
     output_route_masks: Arc<[AtomicU64; 2]>,
-    // One transmit source mask per network send channel. EBU and physical input
-    // sources are mixed only when explicitly patched on the Transmit Routing page.
+    // One transmit source mask per network send channel.
     tx_tone_source_for_send: Arc<Vec<AtomicUsize>>,
     local_labels: Arc<Mutex<Vec<String>>>,
     metadata_socket: Arc<UdpSocket>,
-    metadata_token: [u8; 16],
+    device_name_token: [u8; 16],
     routes: Arc<Mutex<Vec<Route>>>,
     presets: Arc<Mutex<HashMap<String, Vec<Route>>>>,
     stats: Arc<Mutex<UiStats>>,
@@ -965,6 +1030,10 @@ struct WebState {
     runtime: RuntimeSummary,
     devices: Arc<DeviceResponse>,
     restart_lock: Arc<Mutex<()>>,
+    /// RTT in microseconds × 10 (gives 0.1ms resolution without f64 atomic).
+    rtt_us10: Arc<AtomicU32>,
+    /// Name of a conflicting remote device that attempted to connect while already connected.
+    remote_conflict: Arc<Mutex<Option<String>>>,
 }
 
 
@@ -1028,6 +1097,8 @@ struct LocalLabelsRequest {
 #[derive(Debug, Deserialize)]
 struct SetupApplyRequest {
     remote: String,
+    remote_device_name: String,
+    link_password: Option<String>,
     node_id: String,
     token: Option<String>,
     channels: usize,
@@ -1056,6 +1127,7 @@ struct StatusResponse {
     runtime: RuntimeSummary,
     last_control_age_ms: u64,
     last_audio_age_ms: u64,
+    remote_conflict: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1250,22 +1322,22 @@ async fn index_handler(State(_state): State<WebState>) -> Html<String> {
 <body>
 <div id="localLost" class="local-lost"><div class="lost-box"><h2>Not connected</h2><p>The browser has lost its control connection to this AudioLink device. Check that audiolinkd is still running, then refresh when it is back online.</p></div></div>
 <header><div><h1>AudioLink Control</h1><div class="node" id="nodeLine">Starting…</div></div><div class="status"><span id="peerLamp" class="lamp"></span><span id="peerText">No connected device</span></div></header>
-<nav><button class="tab active" data-page="home">Home</button><button class="tab" data-page="txrouting">Transmit Routing</button><button class="tab" data-page="rxrouting">Receive Routing</button><button class="tab" data-page="meters">Peak Meters</button><button class="tab" data-page="setup">Setup</button></nav>
+<nav><button class="tab active" data-page="home">Home</button><button class="tab" data-page="txrouting">Send Routing</button><button class="tab" data-page="rxrouting">Receive Routing</button><button class="tab" data-page="meters">Peak Meters</button><button class="tab" data-page="setup">Setup</button></nav>
 <main>
 <div id="topAlert" class="topalert">REMOTE DEVICE OFFLINE</div>
 <div id="remoteBanner" class="remotealert">Remote connected device offline.</div>
 <section id="home" class="page active"><div class="grid"><div class="card"><h2>Local Link</h2><div class="kv" id="localKv"></div></div><div class="card"><h2>Connected Device</h2><div class="kv" id="peerKv"></div></div><div class="card"><h2>Connection Stats</h2><div class="kv" id="statsKv"></div></div><div class="card"><h2>Audio Engine</h2><div class="kv" id="audioKv"></div></div></div></section>
-<section id="txrouting" class="page"><div class="card"><h2>Transmit Routing</h2><div id="txMatrix"></div></div></section>
+<section id="txrouting" class="page"><div class="card"><h2>Send Routing</h2><div id="txMatrix"></div></div></section>
 <section id="rxrouting" class="page"><div class="card"><h2>Receive Routing</h2><div id="rxMatrix"></div></div></section>
-<section id="meters" class="page"><div class="card"><h2>Peak Meters</h2><h3>Network Send</h3><div class="meterbank" id="txMeters"></div><h3>Network Receive</h3><div class="meterbank" id="rxMeters"></div><h3>Local Output</h3><div class="meterbank" id="monMeters"></div></div></section>
-<section id="setup" class="page"><div class="formgrid"><div class="card"><h2>Link Setup</h2><div class="field"><label>Remote device address</label><input id="cfgPeer" autocomplete="off" placeholder="192.168.64.3"></div><div class="field"><label>Local device name</label><input id="cfgNode" autocomplete="off"></div><div class="field"><label>Link token</label><input id="cfgToken" autocomplete="off" spellcheck="false"></div><div class="field"><label>Network send channels</label><select id="cfgChannels"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></div><div id="setupLink" class="kv"></div></div><div class="card"><h2>Codec</h2><div class="field"><label>Codec</label><select disabled><option>Opus</option></select></div><div class="field"><label>Bitrate per channel</label><select id="bitrate"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></div><div class="field"><label>Frame size</label><select disabled><option>20 ms</option></select></div><div class="field"><label>Incoming audio buffer</label><select id="rxBuffer"><option value="5">5 ms</option><option value="10">10 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="140">140 ms</option><option value="160">160 ms</option><option value="180">180 ms</option><option value="200">200 ms</option><option value="250">250 ms</option><option value="300">300 ms</option><option value="400">400 ms</option><option value="500">500 ms</option><option value="750">750 ms</option><option value="1000">1 s</option><option value="1500">1.5 s</option><option value="2000">2 s</option><option value="3000">3 s</option><option value="5000">5 s</option><option value="10000">10 s</option></select></div><div class="field"><button onclick="applySetup()">Apply and rebuild engine</button></div><pre id="restartCommand" class="cmd"></pre></div><div class="card"><h2>Audio Devices</h2><div id="devices"></div></div></div></section>
+<section id="meters" class="page"><div class="card"><h2>Peak Meters</h2><h3>Send</h3><div class="meterbank" id="txMeters"></div><h3>Receive</h3><div class="meterbank" id="rxMeters"></div><h3>Local Output</h3><div class="meterbank" id="monMeters"></div></div></section>
+<section id="setup" class="page"><div class="formgrid"><div class="card"><h2>Link Setup</h2><div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" placeholder="debian-vm-2"></div><div class="field"><label>Remote host IP (leave blank to wait for incoming)</label><input id="cfgPeer" autocomplete="off" placeholder="192.168.64.3 — blank = responder mode"></div><div class="field"><label>This device name</label><input id="cfgNode" autocomplete="off"></div><div class="field"><label>Link password (optional)</label><div style="display:flex;gap:6px"><input id="cfgLinkPw" autocomplete="off" type="password" placeholder="Leave blank if not required" style="flex:1"><button type="button" onclick="togglePwVis()" id="cfgLinkPwBtn" title="Show/hide password" style="padding:0 10px;font-size:1.1em">👁</button></div></div><div class="field"><label>Link token override (advanced — leave blank)</label><input id="cfgToken" autocomplete="off" spellcheck="false" placeholder="Derived automatically from device name"></div><div class="field"><label>Network send channels</label><select id="cfgChannels"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></div><div id="setupLink" class="kv"></div></div><div class="card"><h2>Codec</h2><div class="field"><label>Codec</label><select disabled><option>Opus</option></select></div><div class="field"><label>Bitrate per channel</label><select id="bitrate"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></div><div class="field"><label>Frame size</label><select disabled><option>20 ms</option></select></div><div class="field"><label>Incoming audio buffer</label><select id="rxBuffer"><option value="5">5 ms</option><option value="10">10 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="140">140 ms</option><option value="160">160 ms</option><option value="180">180 ms</option><option value="200">200 ms</option><option value="250">250 ms</option><option value="300">300 ms</option><option value="400">400 ms</option><option value="500">500 ms</option><option value="750">750 ms</option><option value="1000">1 s</option><option value="1500">1.5 s</option><option value="2000">2 s</option><option value="3000">3 s</option><option value="5000">5 s</option><option value="10000">10 s</option></select></div><div class="field"><button onclick="applySetup()">Apply and rebuild engine</button></div><pre id="restartCommand" class="cmd"></pre></div><div class="card"><h2>Audio Devices</h2><div id="devices"></div></div></div></section>
 </main>
 <script>
 let status={}, stats={}, matrix={sources:[],destinations:[],routes:[]}, devices={};
 let matrixRenderKey='', routeBusy=false, localOk=true;
 let cfgDirty={peer:false,node:false,token:false,channels:false,bitrate:false,rxBuffer:false};
 function markCfgDirty(id,key){let el=$(id); if(el) el.addEventListener('input',()=>cfgDirty[key]=true); if(el) el.addEventListener('change',()=>cfgDirty[key]=true);} 
-window.addEventListener('DOMContentLoaded',()=>{markCfgDirty('cfgPeer','peer');markCfgDirty('cfgNode','node');markCfgDirty('cfgToken','token');markCfgDirty('cfgChannels','channels');markCfgDirty('bitrate','bitrate');markCfgDirty('rxBuffer','rxBuffer');});
+window.addEventListener('DOMContentLoaded',()=>{markCfgDirty('cfgRemoteName','remoteName');markCfgDirty('cfgPeer','peer');markCfgDirty('cfgNode','node');markCfgDirty('cfgLinkPw','linkPw');markCfgDirty('cfgToken','token');markCfgDirty('cfgChannels','channels');markCfgDirty('bitrate','bitrate');markCfgDirty('rxBuffer','rxBuffer');});
 const $=id=>document.getElementById(id);
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab,.page').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.page).classList.add('active')});
 function setLocalOk(ok){localOk=ok;$('localLost').className='local-lost '+(ok?'':'show')}
@@ -1281,7 +1353,7 @@ function segHeights(db){
   let r=Math.max(0,shown-(-10))/60*100;
   return{g,o,r};
 }
-function meter(label,db,key){let finite=Number.isFinite(db)&&db>-100;let shown=Math.max(-60,Math.min(0,finite?db:-120));let ticks=[0,-10,-18,-60].map(t=>`<div class="tick ${t===0||t===-60?'major':t===-18?'ref18':'ref10'}" style="top:${pct(t)}%">${t}</div>`).join('');let h=segHeights(db);return `<div class="meter"><div class="barbox"><div class="seg green" style="height:${h.g}%"></div><div class="seg orange" style="bottom:${h.g}%;height:${h.o}%"></div><div class="seg red" style="bottom:${h.g+h.o}%;height:${h.r}%"></div><div class="ticks">${ticks}</div></div><div class="db">${finite?shown.toFixed(1):'−∞'} dBFS</div><div class="meterlabel">${label}</div></div>`}
+function meter(label,db,key,sublabel){let finite=Number.isFinite(db)&&db>-100;let shown=Math.max(-60,Math.min(0,finite?db:-120));let ticks=[0,-10,-18,-60].map(t=>`<div class="tick ${t===0||t===-60?'major':t===-18?'ref18':'ref10'}" style="top:${pct(t)}%">${t}</div>`).join('');let h=segHeights(db);let sub=sublabel?`<br><span style="font-size:10px;color:var(--muted);display:block;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:64px">${sublabel}</span>`:'';return `<div class="meter"><div class="barbox"><div class="seg green" style="height:${h.g}%"></div><div class="seg orange" style="bottom:${h.g}%;height:${h.o}%"></div><div class="seg red" style="bottom:${h.g+h.o}%;height:${h.r}%"></div><div class="ticks">${ticks}</div></div><div class="db">${finite?shown.toFixed(1):'−∞'} dBFS</div><div class="meterlabel">${label}${sub}</div></div>`}
 function routeSet(){return new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination))}
 function jsq(v){return JSON.stringify(v).replace(/</g,'\u003c')}
 async function toggleRoute(src,dst){if(routeBusy)return;routeBusy=true;try{let routes=[...(matrix.routes||[])];let key=src+'>'+dst;let i=routes.findIndex(r=>r.source+'>'+r.destination===key);if(i>=0)routes.splice(i,1);else routes.push({source:src,destination:dst});let body={routes};if(dst.startsWith('output:'))body.monitor_mode='patch_matrix';let res=await fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});matrix=await res.json();matrixRenderKey='';renderMatrices()}finally{routeBusy=false}}
@@ -1291,14 +1363,16 @@ function updateSignalLamps(){document.querySelectorAll('[data-src-id]').forEach(
 function sendChannelIndex(id){let m=id.match(/^stream:0:ch:(\d+)$/);return m?parseInt(m[1]):null}
 async function sendLocalLabels(){let txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');let labels=txDests.map(d=>{let idx=sendChannelIndex(d.id);let el=idx==null?null:document.querySelector(`[data-label-input="${idx}"]`);return el?el.value:d.label.replace(/^Send \d+ — /,'')});try{let res=await fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})});matrix=await res.json();matrixRenderKey='';renderMatrices()}catch(e){console.error(e)}}
 function destHeader(d){let idx=sendChannelIndex(d.id);if(idx==null)return d.label;let current=d.label.replace(/^Send \d+ — /,'');return `<div class="send-head"><div>Send ${idx+1}</div><input data-label-input="${idx}" value="${current.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}" onchange="sendLocalLabels()" onkeydown="if(event.key==='Enter')this.blur()" onclick="event.stopPropagation()"></div>`}
-function matrixTable(title,sources,destinations,emptyText){if(!sources.length||!destinations.length)return `<div class="empty-note">${emptyText}</div>`;let set=routeSet();let html='<div class="matrix-wrap"><table class="matrix"><thead><tr><th></th>'+destinations.map(d=>`<th>${destHeader(d)}</th>`).join('')+'</tr></thead><tbody>';sources.forEach(s=>{html+=`<tr><th class="rowhead"><span data-src-id="${s.id}" class="sig ${lampClass(sourceDb(s))}"></span>${s.label}<br><small>${s.kind.replaceAll('_',' ')}</small></th>`;destinations.forEach(d=>{let on=set.has(s.id+'>'+d.id);html+=`<td class="xcell ${on?'on':''}" onclick='toggleRoute(${jsq(s.id)},${jsq(d.id)})' title="${s.label} → ${d.label}"></td>`});html+='</tr>'});return html+'</tbody></table></div>'}
-function renderMatrices(){let key=matrixShapeKey();if(key===matrixRenderKey){updateSignalLamps();return}matrixRenderKey=key;let sources=matrix.sources||[], destinations=matrix.destinations||[];let txSources=sources.filter(s=>['test_tone','physical_input'].includes(s.kind));let txDests=destinations.filter(d=>d.kind==='network_send');let rxSources=sources.filter(s=>s.kind==='network_receive');let rxDests=destinations.filter(d=>d.kind==='physical_output');$('txMatrix').innerHTML=matrixTable('Transmit Routing',txSources,txDests,'No transmit channels');$('rxMatrix').innerHTML=matrixTable('Receive Routing',rxSources,rxDests,'No receive sources')}
+function kindLabel(k){return{network_send:'Send',network_receive:'Receive',physical_input:'Local Input',physical_output:'Local Output',test_tone:'Test Tone'}[k]||k.replaceAll('_',' ')}
+function matrixTable(title,sources,destinations,emptyText){if(!sources.length||!destinations.length)return `<div class="empty-note">${emptyText}</div>`;let set=routeSet();let html='<div class="matrix-wrap"><table class="matrix"><thead><tr><th></th>'+destinations.map(d=>`<th>${destHeader(d)}</th>`).join('')+'</tr></thead><tbody>';sources.forEach(s=>{html+=`<tr><th class="rowhead"><span data-src-id="${s.id}" class="sig ${lampClass(sourceDb(s))}"></span>${s.label}<br><small>${kindLabel(s.kind)}</small></th>`;destinations.forEach(d=>{let on=set.has(s.id+'>'+d.id);html+=`<td class="xcell ${on?'on':''}" onclick='toggleRoute(${jsq(s.id)},${jsq(d.id)})' title="${s.label} → ${d.label}"></td>`});html+='</tr>'});return html+'</tbody></table></div>'}
+function renderMatrices(){let key=matrixShapeKey();if(key===matrixRenderKey){updateSignalLamps();return}matrixRenderKey=key;let sources=matrix.sources||[], destinations=matrix.destinations||[];let txSources=sources.filter(s=>['test_tone','physical_input'].includes(s.kind));let txDests=destinations.filter(d=>d.kind==='network_send');let rxSources=sources.filter(s=>s.kind==='network_receive');let rxDests=destinations.filter(d=>d.kind==='physical_output');$('txMatrix').innerHTML=matrixTable('Send Routing',txSources,txDests,'No send channels');$('rxMatrix').innerHTML=matrixTable('Receive Routing',rxSources,rxDests,'No receive sources')}
 function setRemoteAlert(st){let alert=$('topAlert'), banner=$('remoteBanner');let isGood=st==='green';let msg=st==='orange'?'REMOTE DEVICE DEGRADED':'REMOTE DEVICE OFFLINE';alert.className='topalert '+(isGood?'':'show ')+(st==='orange'?'orange':'');alert.textContent=msg;banner.className='remotealert';banner.textContent=''}
 function setSelectValue(id,value){let el=$(id);if(!el)return;let v=String(value);if([...el.options].some(o=>o.value===v||o.text===v))el.value=v}
 function shellQuote(v){return "'"+String(v).replace(/'/g,"'\''")+"'"}
-function showRestartCommand(){let peer=$('cfgPeer').value||status.runtime?.peer||'';let node=$('cfgNode').value||status.node_id||'';let channels=$('cfgChannels').value||status.local_channels||2;let bitrate=$('bitrate').value||status.runtime?.opus_bitrate_per_channel||128000;let rxBuffer=$('rxBuffer').value||status.runtime?.latency_ms||120;let cmd=`audiolinkd bidir ${shellQuote(peer.split(':')[0])} --channels ${channels} --id ${shellQuote(node)} --bitrate ${bitrate} --latency-ms ${rxBuffer}`;$('restartCommand').textContent=cmd}
-async function applySetup(){let body={remote:$('cfgPeer').value,node_id:$('cfgNode').value,token:$('cfgToken').value,channels:Number($('cfgChannels').value),opus_bitrate_per_channel:Number($('bitrate').value),receive_buffer_ms:Number($('rxBuffer').value)};$('restartCommand').textContent='Applying… audio engine will reconnect.';try{let res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});let txt=await res.text();if(!res.ok){$('restartCommand').textContent=txt;return}let data=JSON.parse(txt);cfgDirty={peer:false,node:false,token:false,channels:false,bitrate:false,rxBuffer:false};$('restartCommand').textContent='Rebuilding engine with:\n'+data.command.map(shellQuote).join(' ')}catch(e){$('restartCommand').textContent='Apply failed: '+e}}
-function render(){setLocalOk(true);let dev=status.remote||{};let st=status.peer_status||'gray';$('peerLamp').className='lamp '+(st==='green'?'green':st==='orange'?'orange':'');$('peerText').textContent=st==='green'?'Remote device online':st==='orange'?'Remote device degraded':'Remote device offline';setRemoteAlert(st);$('nodeLine').textContent=`Node ${status.node_id||''} · ${status.monitor_mode||''}`;setKv('localKv',[['Node ID',status.node_id||'—'],['Mode','Bidirectional'],['Source',status.runtime?.source||'—'],['Network send channels',status.local_channels??'—'],['Opus bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—'],['Local inputs',status.local_input_channels??0],['Monitor',status.monitor_mode||'—']]);setKv('peerKv',[['Remote device ID',dev.node_id||'—'],['RX channels',status.remote_channels??0],['Status',status.peer_status||'gray'],['Last keepalive/control',status.last_control_age_ms!=null?Math.round(status.last_control_age_ms/100)/10+' s ago':'—'],['Last audio',status.last_audio_age_ms!=null?Math.round(status.last_audio_age_ms/100)/10+' s ago':'—'],['Metadata',dev.labels?dev.labels.join(', '):'—']]);setKv('statsKv',[['TX rate',((stats.tx_mbps??0)).toFixed(3)+' Mb/s'],['RX rate',((stats.rx_mbps??0)).toFixed(3)+' Mb/s'],['Packet loss',((stats.loss_percent??0)).toFixed(3)+' %'],['Missing packets',stats.seq_missing??0],['Jitter',((stats.jitter_ms??0)).toFixed(2)+' ms'],['Link latency','not measured yet'],['Incoming audio buffer',(stats.fill_ms??0)+' ms'],['Configured buffer',(status.runtime?.latency_ms??'—')+' ms'],['Effective target buffer',(stats.target_ms??status.runtime?.effective_latency_ms??'—')+' ms'],['Estimated audio latency','pending link timing'],['Drift pressure',(stats.drift_pressure_ppm??0)+' ppm'],['Decoded fps',(stats.decoded_fps??0).toFixed(1)],['TX fps',(stats.tx_fps??0).toFixed(1)],['Queued groups',stats.queued_groups??0],['Output underflows',stats.output_underflows??0],['PLC channels',stats.plc_channels??0],['RTT','not measured yet']]);setKv('audioKv',[['Codec','Opus'],['Bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s per channel':'—'],['Frame','20 ms / 960 samples'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured / '+(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms effective'],['Phase lock',stats.phase_lock?'on':'off'],['Generator','EBU R49']]);if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.peer||'').split(':')[0];if(!cfgDirty.node)$('cfgNode').value=status.node_id||'';if(!cfgDirty.token)$('cfgToken').value=status.runtime?.token_hint||'';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels??2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel??128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms??120);setKv('setupLink',[["Current remote",status.runtime?.peer||'not configured'],['Current local device name',status.node_id||'—'],['Token',status.runtime?.token_configured?'configured':'generated'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured'],['Effective buffer',(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms'],['Config file','audiolinkd_config.json']]);$('devices').innerHTML=`<div class="kv"><span>Sample rate</span><b>${devices.sample_rate||48000} Hz</b><span>Default input</span><b>${devices.default_input||'none'}</b><span>Input channels</span><b>${devices.default_input_channels??0}</b><span>Default output</span><b>${devices.default_output||'none'}</b><span>Output channels</span><b>${devices.default_output_channels??0}</b></div><h3>Inputs</h3><p>${(devices.inputs||[]).join('<br>')||'none'}</p><h3>Outputs</h3><p>${(devices.outputs||[]).join('<br>')||'none'}</p>`;$('txMeters').innerHTML=(stats.tx_peak_dbfs||[]).map((v,i)=>meter('Send '+(i+1),v,'tx'+i)).join('')||'<p class="note">No TX channels</p>';let remoteOnline=(st==='green'||st==='orange')&&(status.remote_channels||0)>0;$('rxMeters').innerHTML=remoteOnline?(stats.rx_peak_dbfs||[]).map((v,i)=>meter('Receive '+(i+1),v,'rx'+i)).join(''):'<div class="empty-note">No connected remote device</div>';$('monMeters').innerHTML=(stats.monitor_peak_dbfs||[-120,-120]).map((v,i)=>meter(i?'Local Output 2':'Local Output 1',v,'mon'+i)).join('');renderMatrices()}
+function showRestartCommand(){let peer=$('cfgPeer').value||status.runtime?.remote_host||'';let node=$('cfgNode').value||status.node_id||'';let remoteName=$('cfgRemoteName').value||status.runtime?.remote_device_name||'';let channels=$('cfgChannels').value||status.local_channels||2;let bitrate=$('bitrate').value||status.runtime?.opus_bitrate_per_channel||128000;let rxBuffer=$('rxBuffer').value||status.runtime?.latency_ms||120;let cmd=`audiolinkd bidir --remote-name ${shellQuote(remoteName)}${peer?' --remote-host '+shellQuote(peer.split(':')[0]):''}  --channels ${channels} --id ${shellQuote(node)} --bitrate ${bitrate} --latency-ms ${rxBuffer}`;$('restartCommand').textContent=cmd}
+async function applySetup(){let body={remote:$('cfgPeer').value,remote_device_name:$('cfgRemoteName').value,link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value),opus_bitrate_per_channel:Number($('bitrate').value),receive_buffer_ms:Number($('rxBuffer').value)};$('restartCommand').textContent='Applying…';try{let res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});let txt=await res.text();if(!res.ok){$('restartCommand').textContent=txt;return}cfgDirty={peer:false,node:false,remoteName:false,linkPw:false,token:false,channels:false,bitrate:false,rxBuffer:false};$('restartCommand').textContent='Engine rebuilding — reconnecting shortly.'}catch(e){$('restartCommand').textContent='Apply failed: '+e}}
+function togglePwVis(){let f=$('cfgLinkPw');f.type=f.type==='password'?'text':'password';}
+function render(){setLocalOk(true);let dev=status.remote||{};let st=status.peer_status||'gray';let conflict=status.remote_conflict;$('peerLamp').className='lamp '+(st==='green'?'green':st==='orange'?'orange':'');let connText=st==='green'?('Connected — auto-handshake established'+(dev.node_id?' with '+dev.node_id:'')):st==='orange'?'Remote device degraded':'Remote device offline';$('peerText').textContent=connText;if(conflict){$('peerText').textContent='Connection conflict — '+conflict+' attempted to connect while already connected to '+(dev.node_id||'another device')}setRemoteAlert(st);$('nodeLine').textContent=`Node ${status.node_id||''} · ${status.monitor_mode||''}`;setKv('localKv',[['Device Name',status.node_id||'—'],['Mode','Bidirectional'],['Source',status.runtime?.source||'—'],['Network send channels',status.local_channels??'—'],['Opus bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—'],['Local inputs',status.local_input_channels??0],['Monitor',status.monitor_mode||'—']]);setKv('peerKv',[['Remote device name',dev.node_id||status.runtime?.remote_device_name||'—'],['Remote host',status.runtime?.remote_host||'—'],['RX channels',status.remote_channels??0],['Status',status.peer_status||'gray'],['Last keepalive',status.last_control_age_ms!=null?Math.round(status.last_control_age_ms/100)/10+' s ago':'—'],['Last audio',status.last_audio_age_ms!=null?Math.round(status.last_audio_age_ms/100)/10+' s ago':'—'],['Metadata',dev.labels?dev.labels.join(', '):'—']]);setKv('statsKv',[['TX rate',((stats.tx_mbps??0)).toFixed(3)+' Mb/s'],['RX rate',((stats.rx_mbps??0)).toFixed(3)+' Mb/s'],['Packet loss',((stats.loss_percent??0)).toFixed(3)+' %'],['Missing packets',stats.seq_missing??0],['Jitter',((stats.jitter_ms??0)).toFixed(2)+' ms'],['RTT',stats.rtt_ms?(stats.rtt_ms.toFixed(1)+' ms'):'not measured yet'],['Estimated one-way latency',stats.one_way_latency_ms?(stats.one_way_latency_ms.toFixed(1)+' ms'):'pending'],['Incoming audio buffer',(stats.fill_ms??0)+' ms'],['Configured buffer',(status.runtime?.latency_ms??'—')+' ms'],['Effective target buffer',(stats.target_ms??status.runtime?.effective_latency_ms??'—')+' ms'],['Estimated audio latency',stats.one_way_latency_ms&&stats.fill_ms?(((stats.one_way_latency_ms)+(stats.fill_ms??0)).toFixed(1)+' ms'):'pending'],['Drift pressure',(stats.drift_pressure_ppm??0)+' ppm'],['Decoded fps',(stats.decoded_fps??0).toFixed(1)],['TX fps',(stats.tx_fps??0).toFixed(1)],['Queued groups',stats.queued_groups??0],['Output underflows',stats.output_underflows??0],['PLC channels',stats.plc_channels??0],['Ring overflows',stats.ring_overflows??0]]);setKv('audioKv',[['Codec','Opus'],['Bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s per channel':'—'],['Frame','20 ms / 960 samples'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured / '+(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms effective'],['Phase lock',stats.phase_lock?'on':'off'],['Generator','EBU R49']]);if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.node)$('cfgNode').value=status.node_id||'';if(!cfgDirty.token)$('cfgToken').value='';if(!cfgDirty.linkPw){$('cfgLinkPw').value='';$('cfgLinkPw').placeholder=status.runtime?.link_password_configured?'Password is set — enter new password to change, or leave blank to keep':'Leave blank if not required';}if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels??2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel??128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms??120);setKv('setupLink',[['Remote device name',status.runtime?.remote_device_name||'not configured'],['Remote host (initiator only)',status.runtime?.remote_host||'blank (responder mode)'],['Current device name',status.node_id||'—'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured'],['Effective buffer',(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms'],['Config file','audiolinkd_config.json']]);$('devices').innerHTML=`<div class="kv"><span>Sample rate</span><b>${devices.sample_rate||48000} Hz</b><span>Default input</span><b>${devices.default_input||'none'}</b><span>Input channels</span><b>${devices.default_input_channels??0}</b><span>Default output</span><b>${devices.default_output||'none'}</b><span>Output channels</span><b>${devices.default_output_channels??0}</b></div><h3>Inputs</h3><p>${(devices.inputs||[]).join('<br>')||'none'}</p><h3>Outputs</h3><p>${(devices.outputs||[]).join('<br>')||'none'}</p>`;let txLabels=(matrix.destinations||[]).filter(d=>d.kind==='network_send').map(d=>d.label.replace(/^Send \d+ — /,''));let rxLabels=(matrix.sources||[]).filter(s=>s.kind==='network_receive').map(s=>s.label.replace(/^\S+ /,''));$('txMeters').innerHTML=(stats.tx_peak_dbfs||[]).map((v,i)=>meter('Send '+(i+1),v,'tx'+i,txLabels[i]||'')).join('')||'<p class="note">No send channels</p>';let remoteOnline=(st==='green'||st==='orange')&&(status.remote_channels||0)>0;$('rxMeters').innerHTML=remoteOnline?(stats.rx_peak_dbfs||[]).map((v,i)=>meter('Receive '+(i+1),v,'rx'+i,rxLabels[i]||'')).join(''):'<div class="empty-note">No connected remote device</div>';$('monMeters').innerHTML=(stats.monitor_peak_dbfs||[-120,-120]).map((v,i)=>meter(i?'Local Output 2':'Local Output 1',v,'mon'+i)).join('');renderMatrices()}
 async function loadDevices(){try{devices=await fetch('/api/audio/devices').then(r=>r.json())}catch(e){console.error(e)}}
 async function poll(){try{[status,stats,matrix]=await Promise.all([fetch('/api/status').then(r=>r.json()),fetch('/api/stats').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);render()}catch(e){console.error(e);setLocalOk(false)}}
 loadDevices().then(poll);setInterval(poll,100);
@@ -1310,6 +1384,7 @@ async fn status_handler(State(state): State<WebState>) -> Json<StatusResponse> {
     let now_ms = now_millis();
     let last_control = state.last_control_ms.load(Ordering::Relaxed);
     let last_audio = state.last_audio_ms.load(Ordering::Relaxed);
+    let remote_conflict = state.remote_conflict.lock().ok().and_then(|c| c.clone());
     Json(StatusResponse {
         node_id: state.node_id.clone(),
         uptime_seconds: state.started_at.elapsed().as_secs(),
@@ -1324,6 +1399,7 @@ async fn status_handler(State(state): State<WebState>) -> Json<StatusResponse> {
         runtime: state.runtime.clone(),
         last_control_age_ms: if last_control == 0 { 0 } else { now_ms.saturating_sub(last_control) },
         last_audio_age_ms: if last_audio == 0 { 0 } else { now_ms.saturating_sub(last_audio) },
+        remote_conflict,
     })
 }
 
@@ -1370,9 +1446,14 @@ async fn local_labels_post_handler(State(state): State<WebState>, Json(req): Jso
         *current = labels.clone();
     }
 
+    // Persist labels so they survive engine restarts and channel count changes.
+    let mut persisted = load_persisted_state();
+    persisted.config.channel_labels = Some(labels.clone());
+    save_persisted_state(&persisted);
+
     if state.handshake_connected.load(Ordering::Relaxed) {
         let pkt = build_metadata_packet_with_labels(
-            &state.metadata_token,
+            &state.device_name_token,
             state.local_channels,
             &state.node_id,
             &labels,
@@ -1411,24 +1492,31 @@ async fn preset_recall_handler(State(state): State<WebState>, Json(req): Json<Pr
 
 async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<SetupApplyRequest>) -> impl IntoResponse {
     let remote = req.remote.trim();
+    let remote_device_name = req.remote_device_name.trim();
     let node_id = req.node_id.trim();
-    if remote.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Remote device address is required").into_response();
+    if remote_device_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Remote device name is required").into_response();
     }
     if node_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Node name is required").into_response();
+        return (StatusCode::BAD_REQUEST, "Device name is required").into_response();
     }
     if req.channels == 0 || req.channels > MAX_CHANNELS {
         return (StatusCode::BAD_REQUEST, format!("Network send channels must be 1-{MAX_CHANNELS}")).into_response();
     }
-    let token_text = req.token.as_deref().unwrap_or(&state.runtime.token_hex).trim();
-    if token_text.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Link token is required").into_response();
-    }
-    let token_hex = match parse_token_arg(token_text) {
-        Ok(token) => token_to_hex(&token),
-        Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid link token: {e}")).into_response(),
+
+    // Derive link token from remote device name + optional password.
+    // If an explicit hex token is provided it overrides derivation (power-user escape hatch).
+    let link_password = req.link_password.as_deref().unwrap_or("").trim();
+    let (token_hex, token_derived) = if let Some(explicit) = req.token.as_deref().filter(|t| !t.trim().is_empty()) {
+        match parse_token_arg(explicit.trim()) {
+            Ok(token) => (token_to_hex(&token), false),
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid explicit token: {e}")).into_response(),
+        }
+    } else {
+        let token = derive_link_token(node_id, remote_device_name, if link_password.is_empty() { None } else { Some(link_password) });
+        (token_to_hex(&token), true)
     };
+
     if !(8_000..=512_000).contains(&req.opus_bitrate_per_channel) {
         return (StatusCode::BAD_REQUEST, "Opus bitrate must be 8000-512000 bits/sec per channel").into_response();
     }
@@ -1442,7 +1530,8 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
 
     let mut args = vec![
         "bidir".to_string(),
-        split_host_port(remote),
+        "--remote-name".to_string(),
+        remote_device_name.to_string(),
         "--channels".to_string(),
         req.channels.to_string(),
         "--id".to_string(),
@@ -1456,6 +1545,15 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
         "--monitor".to_string(),
         "matrix".to_string(),
     ];
+    // Remote host is optional — blank means responder mode.
+    if !remote.is_empty() {
+        args.push("--remote-host".to_string());
+        args.push(split_host_port(remote));
+    }
+    if !link_password.is_empty() {
+        args.push("--link-password".to_string());
+        args.push(link_password.to_string());
+    }
     if state.runtime.fixed_jitter { args.push("--fixed-jitter".to_string()); }
     if !state.runtime.phase_lock { args.push("--no-phase-lock".to_string()); }
     if !state.runtime.send_enabled { args.push("--no-send".to_string()); }
@@ -1473,13 +1571,25 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
             command_preview.push("<token hidden>".to_string());
             hide_next = false;
         } else {
-            if arg == "--token" { hide_next = true; }
+            if arg == "--token" || arg == "--link-password" { hide_next = true; }
             command_preview.push(arg.clone());
         }
     }
 
+    let token_source = if token_derived {
+        if link_password.is_empty() {
+            format!("derived from {node_id}:{remote_device_name} (sorted pair)")
+        } else {
+            format!("derived from {node_id}:{remote_device_name} + password (sorted pair)")
+        }
+    } else {
+        "explicit override".to_string()
+    };
+
     save_persisted_config(PersistedRuntimeConfig {
-        remote: Some(split_host_port(remote)),
+        remote: if remote.is_empty() { None } else { Some(split_host_port(remote)) },
+        remote_device_name: Some(remote_device_name.to_string()),
+        link_password: if link_password.is_empty() { None } else { Some(link_password.to_string()) },
         node_id: Some(node_id.to_string()),
         token_hex: Some(token_hex.clone()),
         channels: Some(req.channels),
@@ -1487,9 +1597,17 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
         latency_ms: Some(receive_buffer_ms),
         fixed_jitter: Some(state.runtime.fixed_jitter),
         phase_lock: Some(state.runtime.phase_lock),
+        channel_labels: None, // preserved by save_persisted_config — not overwritten here
     });
 
-    tracing::warn!("Setup Apply: rebuilding audio engine with remote={} node={} channels={} bitrate={} receive_buffer={}ms effective_buffer={}ms and saved audiolinkd_config.json", remote, node_id, req.channels, req.opus_bitrate_per_channel, receive_buffer_ms, effective_buffer_ms);
+    let role = if remote.is_empty() { "responder (waiting for incoming)" } else { "initiator" };
+    tracing::warn!(
+        "Setup Apply: role={role} remote_device={remote_device_name} remote_host={} node={} \
+         channels={} bitrate={} receive_buffer={}ms effective_buffer={}ms token={} saved audiolinkd_config.json",
+        if remote.is_empty() { "<blank>" } else { remote },
+        node_id, req.channels, req.opus_bitrate_per_channel, receive_buffer_ms, effective_buffer_ms,
+        token_source
+    );
 
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(250));
@@ -1558,7 +1676,7 @@ fn control_web_state(node_id: String, shared_token: [u8; 16], send_channels: usi
     let monitor_mode_atomic = Arc::new(AtomicU8::new(MonitorMode::PatchMatrix.as_u8()));
     let output_route_masks = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     let tx_tone_source_for_send = Arc::new((0..MAX_CHANNELS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
-    let local_labels = Arc::new(Mutex::new((0..send_channels).map(local_channel_label).collect::<Vec<_>>()));
+    let local_labels = Arc::new(Mutex::new(load_persisted_labels(send_channels)));
     let presets = Arc::new(Mutex::new(HashMap::new()));
     let mut initial_stats = UiStats::default();
     initial_stats.target_ms = jitter.target_delay_ms;
@@ -1588,14 +1706,15 @@ fn control_web_state(node_id: String, shared_token: [u8; 16], send_channels: usi
         tx_tone_source_for_send,
         local_labels,
         metadata_socket,
-        metadata_token: derive_token_from_text(&node_id),
+        device_name_token: derive_token_from_text(&node_id),
         routes,
         presets,
         stats,
         meters,
         runtime: RuntimeSummary {
             mode: "bidirectional-ready".into(),
-            peer: String::new(),
+            remote_host: String::new(),
+            remote_device_name: String::new(),
             source: "Matrix".into(),
             codec: "Opus".into(),
             opus_bitrate_per_channel,
@@ -1610,10 +1729,13 @@ fn control_web_state(node_id: String, shared_token: [u8; 16], send_channels: usi
             effective_latency_ms: jitter.target_delay_ms,
             fixed_jitter: !jitter.adaptive,
             phase_lock: jitter.phase_lock,
-            web_note: "Web control is running. Configure a remote device and apply to start the audio/network engine. The default M7 development link token is shared unless changed.".into(),
+            web_note: "Web control is running. Configure a remote device and apply to start the audio/network engine.".into(),
+            link_password_configured: false,
         },
         devices,
         restart_lock: Arc::new(Mutex::new(())),
+        rtt_us10: Arc::new(AtomicU32::new(0)),
+        remote_conflict: Arc::new(Mutex::new(None)),
     };
     spawn_control_only_metering(&state);
     Ok(state)
@@ -1846,13 +1968,14 @@ fn spawn_web_ui(addr: String, state: WebState) {
 // ─── Bidirectional mode (M3/M4) ───────────────────────────────────────────────
 
 pub fn run_bidir(
-    peer_ip: &str,
+    remote_host: &str,          // IP/hostname of remote — empty string = responder mode
+    remote_device_name: &str,   // Device name of remote — used to derive link token
     num_channels: usize,
     _source: Source,
     send_enabled: bool,
     recv_enabled: bool,
-    my_token: [u8; 16],
-    shared_token: [u8; 16],
+    device_name_token: [u8; 16], // derive_token_from_text(my own node_id) — sent in probe as "who I am"
+    shared_token: [u8; 16],      // link token — authentication
     node_id: String,
     jitter: JitterConfig,
     web_addr: Option<String>,
@@ -1863,9 +1986,18 @@ pub fn run_bidir(
         return Err(anyhow!("Channel count must be 1–{MAX_CHANNELS}"));
     }
 
-    let peer_addr = format!("{peer_ip}:{PORT}");
+    let is_initiator = !remote_host.trim().is_empty();
+    let remote_addr_str = format!("{remote_host}:{PORT}");
+
+    // Initiator: connect immediately. Responder: bind only and late-connect on first valid probe.
     let socket = Arc::new(UdpSocket::bind(format!("0.0.0.0:{PORT}"))?);
-    socket.connect(&peer_addr)?;
+    if is_initiator {
+        socket.connect(&remote_addr_str)?;
+    }
+
+    // Tracks the established remote address in responder mode.
+    // Arc<Mutex<Option<SocketAddr>>> so keepalive and send threads can check before sending.
+    let established_addr: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
 
     let handshake_connected = Arc::new(AtomicBool::new(false));
     let last_control_ms = Arc::new(AtomicU64::new(0));
@@ -1875,7 +2007,7 @@ pub fn run_bidir(
     let monitor_mode_atomic = Arc::new(AtomicU8::new(monitor_mode.as_u8()));
     let output_route_masks = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
     let tx_tone_source_for_send = Arc::new((0..MAX_CHANNELS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
-    let local_labels = Arc::new(Mutex::new((0..num_channels).map(local_channel_label).collect::<Vec<_>>()));
+    let local_labels = Arc::new(Mutex::new(load_persisted_labels(num_channels)));
     let presets = Arc::new(Mutex::new(HashMap::new()));
     let mut initial_ui_stats = UiStats::default();
     initial_ui_stats.target_ms = jitter.target_delay_ms;
@@ -1887,6 +2019,8 @@ pub fn run_bidir(
     apply_routes_to_masks(&initial_routes, &output_route_masks);
     apply_routes_to_tx_sources(&initial_routes, &tx_tone_source_for_send);
     let routes = Arc::new(Mutex::new(initial_routes));
+    let rtt_us10 = Arc::new(AtomicU32::new(0));
+    let remote_conflict: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let web_state = WebState {
         started_at: Instant::now(),
@@ -1905,14 +2039,15 @@ pub fn run_bidir(
         tx_tone_source_for_send: Arc::clone(&tx_tone_source_for_send),
         local_labels: Arc::clone(&local_labels),
         metadata_socket: Arc::clone(&socket),
-        metadata_token: my_token,
+        device_name_token: device_name_token,
         routes: Arc::clone(&routes),
         presets: Arc::clone(&presets),
         stats: Arc::clone(&ui_stats),
         meters: Arc::clone(&meters),
         runtime: RuntimeSummary {
-            mode: "bidirectional".into(),
-            peer: peer_addr.clone(),
+            mode: if is_initiator { "bidirectional".into() } else { "bidirectional-responder".into() },
+            remote_host: if is_initiator { remote_addr_str.clone() } else { String::new() },
+            remote_device_name: remote_device_name.to_string(),
             source: "Matrix".into(),
             codec: "Opus".into(),
             opus_bitrate_per_channel,
@@ -1928,33 +2063,58 @@ pub fn run_bidir(
             fixed_jitter: !jitter.adaptive,
             phase_lock: jitter.phase_lock,
             web_note: "Setup Apply performs a controlled process rebuild so the UDP socket, Opus encoders, metadata and routing state are recreated cleanly.".into(),
+            link_password_configured: load_persisted_state().config.link_password.map(|p| !p.is_empty()).unwrap_or(false),
         },
         devices: Arc::clone(&devices),
         restart_lock: Arc::new(Mutex::new(())),
+        rtt_us10: Arc::clone(&rtt_us10),
+        remote_conflict: Arc::clone(&remote_conflict),
     };
     if let Some(addr) = web_addr {
         spawn_web_ui(addr, web_state);
     }
 
     tracing::info!(
-        "Bidir: peer={peer_addr}  channels={num_channels}  source=matrix  \
-         send={send_enabled}  recv={recv_enabled}  id={node_id}  receive_buffer={}ms effective={}ms  adaptive_jitter={}  phase_lock={}" ,
-         jitter.configured_delay_ms, jitter.target_delay_ms, jitter.adaptive, jitter.phase_lock
+        "Bidir: role={}  remote_device={remote_device_name}  remote_host={}  channels={num_channels}  \
+         send={send_enabled}  recv={recv_enabled}  id={node_id}  \
+         receive_buffer={}ms effective={}ms  adaptive_jitter={}  phase_lock={}",
+        if is_initiator { "initiator" } else { "responder (waiting for incoming)" },
+        if is_initiator { &remote_addr_str } else { "<blank>" },
+        jitter.configured_delay_ms, jitter.target_delay_ms, jitter.adaptive, jitter.phase_lock
     );
 
-    // M5 handshake / keepalive thread. 09 07 continues after connection to keep NAT open.
+    // M5 handshake / keepalive thread.
+    // Initiator: sends 09 07 probes every 2130ms to punch NAT and keep the connection alive.
+    // Responder: only sends keepalive once connected (no address to probe before first handshake).
+    // Both modes: sends RTT ping (09 0b) every cycle once connected.
     {
         let socket_hs = Arc::clone(&socket);
         let connected_hs = Arc::clone(&handshake_connected);
-        let local_labels_hs = Arc::clone(&local_labels);
+        let _local_labels_hs = Arc::clone(&local_labels);
+        let rtt_hs = Arc::clone(&rtt_us10);
+        let remote_device_name_hs = remote_device_name.to_string(); // owned for 'static move closure
         std::thread::spawn(move || {
-            let probe = build_probe_packet(&my_token, &shared_token);
+            let probe = build_probe_packet(&device_name_token, &shared_token);
             loop {
-                socket_hs.send(&probe).ok();
-                if connected_hs.load(Ordering::Relaxed) {
-                    tracing::trace!("09 07 keepalive sent");
+                let connected = connected_hs.load(Ordering::Relaxed);
+                if is_initiator {
+                    socket_hs.send(&probe).ok();
+                    if connected {
+                        tracing::trace!("09 07 keepalive sent");
+                        let ts = now_us();
+                        socket_hs.send(&build_rtt_ping(ts)).ok();
+                        rtt_hs.store(0, Ordering::Relaxed);
+                    } else {
+                        tracing::trace!("09 07 probe sent");
+                    }
+                } else if connected {
+                    socket_hs.send(&probe).ok();
+                    let ts = now_us();
+                    socket_hs.send(&build_rtt_ping(ts)).ok();
+                    rtt_hs.store(0, Ordering::Relaxed);
+                    tracing::trace!("09 07 keepalive sent (responder)");
                 } else {
-                    tracing::trace!("09 07 probe sent");
+                    tracing::trace!("Responder: waiting for incoming connection from {remote_device_name_hs}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2130));
             }
@@ -1981,12 +2141,20 @@ pub fn run_bidir(
             out_device.name().unwrap_or_default()
         );
 
+        // Size rings and prime depth from the configured target latency.
+        // Ring capacity = 2× target so ASRC has headroom both above and below the setpoint.
+        // Minimum ring is PB_RING_SIZE (1s); minimum prime is PRIME_SAMPLES (120ms) so
+        // low-latency configs still start quickly.
+        let prime_samples = ((jitter.target_delay_ms as usize * SAMPLE_RATE as usize) / 1000)
+            .max(PRIME_SAMPLES);
+        let ring_samples = (prime_samples * 2).max(PB_RING_SIZE);
+
         // One lock-free ring per channel.
         // Producers go to the recv thread; consumers go to the output callback.
         let mut pb_prods = Vec::with_capacity(MAX_CHANNELS);
         let mut pb_conss = Vec::with_capacity(MAX_CHANNELS);
         for _ in 0..MAX_CHANNELS {
-            let (prod, cons) = HeapRb::<f32>::new(PB_RING_SIZE).split();
+            let (prod, cons) = HeapRb::<f32>::new(ring_samples).split();
             pb_prods.push(prod);
             pb_conss.push(cons);
         }
@@ -2015,9 +2183,11 @@ pub fn run_bidir(
         let meters_recv = Arc::clone(&meters);
         let local_labels_recv = Arc::clone(&local_labels);
         let node_id_recv = node_id.clone();
-        let correction_ppm = Arc::new(AtomicI32::new(0));
-        let correction_ppm_recv = Arc::clone(&correction_ppm);
-        let correction_ppm_play = Arc::clone(&correction_ppm);
+        let rtt_us10_recv = Arc::clone(&rtt_us10);
+        let remote_conflict_recv = Arc::clone(&remote_conflict);
+        let established_addr_recv = Arc::clone(&established_addr);
+        let ring_overflows = Arc::new(AtomicUsize::new(0));
+        let ring_overflows_recv = Arc::clone(&ring_overflows);
 
         // Receive + jitter/decode thread.
         //
@@ -2054,6 +2224,21 @@ pub fn run_bidir(
                 .map(|_| opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap())
                 .collect();
 
+            // One Rubato FastFixedIn resampler per channel.
+            // Ratio 1.0 at init; updated each loop iteration from correction_ratio.
+            // PolynomialDegree::Linear gives transparent interpolation at sub-500ppm
+            // rates with negligible CPU cost. The max_relative of 1.01 covers our
+            // ±5000ppm control clamp with headroom.
+            let mut resamplers: Vec<FastFixedIn<f32>> = (0..MAX_CHANNELS)
+                .map(|_| FastFixedIn::new(
+                    1.0,
+                    1.01,
+                    PolynomialDegree::Linear,
+                    FRAME_SAMPLES,
+                    1,
+                ).expect("Rubato resampler init failed"))
+                .collect();
+
             let mut buf = vec![0u8; 65535];
             let mut pcm = vec![0f32; FRAME_SAMPLES];
             let mut decoded_frame: Vec<Vec<f32>> = vec![vec![0.0; FRAME_SAMPLES]; MAX_CHANNELS];
@@ -2076,51 +2261,99 @@ pub fn run_bidir(
             let mut output_underflows_at_last_stats: usize = 0;
             let mut plc_count_at_last_stats: usize = 0;
             let mut lost_packets_at_last_stats: usize = 0;
-            let mut correction_ratio: f64 = 1.0;
+            let mut correction_ratio: f64 = 1.0; // updated each iteration; 1.0 on first drain is correct
             if jitter.phase_lock {
-                tracing::info!("M6 jitter: phase-locked timestamp buffer active; drift correction not yet active");
+                tracing::info!("M6 jitter: phase-locked timestamp buffer active; Rubato ASRC active");
             }
 
             loop {
-                match socket_recv.recv(&mut buf) {
-                    Ok(n) => {
+                // In responder mode we use recv_from so we can extract the sender's address
+                // for the late-connect. In initiator mode we use recv (socket is already connected).
+                let recv_result = if is_initiator {
+                    socket_recv.recv(&mut buf).map(|n| (n, None))
+                } else {
+                    socket_recv.recv_from(&mut buf).map(|(n, addr)| (n, Some(addr)))
+                };
+
+                match recv_result {
+                    Ok((n, src_addr_opt)) => {
+                        // Responder: late-connect on first valid handshake or media packet.
+                        if !is_initiator {
+                            if let Some(src_addr) = src_addr_opt {
+                                let mut established = established_addr_recv.lock().unwrap();
+                                match *established {
+                                    None => {
+                                        // First packet from any source — connect to it.
+                                        if let Err(e) = socket_recv.connect(src_addr) {
+                                            tracing::error!("Responder: late-connect to {src_addr} failed: {e}");
+                                        } else {
+                                            tracing::info!("Responder: late-connected to {src_addr}");
+                                            *established = Some(src_addr);
+                                        }
+                                    }
+                                    Some(known) if known != src_addr => {
+                                        // Packet from a different address while already connected — conflict.
+                                        tracing::warn!(
+                                            "Connection conflict: packet from {src_addr} but already connected to {known}"
+                                        );
+                                        if let Ok(mut c) = remote_conflict_recv.lock() {
+                                            if c.is_none() {
+                                                *c = Some(src_addr.to_string());
+                                            }
+                                        }
+                                        continue; // reject this packet
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+
                         if let Some(pkt) = parse_handshake_packet(&buf[..n]) {
                             last_control_recv.store(now_millis(), Ordering::Relaxed);
                             match pkt {
-                                HandshakePacket::Probe { expected_peer } if expected_peer == shared_token => {
+                                HandshakePacket::Probe { sender_token, expected_peer } if expected_peer == shared_token => {
+                                    // If we now know the sender's device name from metadata, use it for conflict reporting.
+                                    // For now store sender_token hex as the conflict identifier.
+                                    let sender_name = last_remote_metadata.as_ref()
+                                        .and_then(|m| m.node_id.clone())
+                                        .unwrap_or_else(|| token_to_hex(&sender_token));
                                     socket_recv.send(&build_accept_packet(&shared_token)).ok();
                                     socket_recv.send(&build_confirm_packet(&shared_token)).ok();
                                     socket_recv
                                         .send(&build_metadata_packet_with_labels(
-                                    &my_token,
-                                    num_channels,
-                                    &node_id_recv,
-                                    &local_labels_recv.lock().map(|l| l.clone()).unwrap_or_else(|_| (0..num_channels).map(local_channel_label).collect()),
-                                ))
+                                        &device_name_token,
+                                        num_channels,
+                                        &node_id_recv,
+                                        &local_labels_recv.lock().map(|l| l.clone()).unwrap_or_else(|_| (0..num_channels).map(local_channel_label).collect()),
+                                    ))
                                         .ok();
                                     if !connected_recv.swap(true, Ordering::Relaxed) {
                                         tracing::info!(
-                                            "Handshake: received 09 07, sent 09 09 / 09 08 / 09 0a"
+                                            "Handshake: received 09 07 from {sender_name}, sent 09 09 / 09 08 / 09 0a"
                                         );
+                                        // Clear any stale conflict once a fresh valid handshake completes.
+                                        if let Ok(mut c) = remote_conflict_recv.lock() { *c = None; }
                                     }
                                 }
                                 HandshakePacket::Accept { token } if token == shared_token => {
                                     socket_recv.send(&build_confirm_packet(&shared_token)).ok();
                                     socket_recv
                                         .send(&build_metadata_packet_with_labels(
-                                    &my_token,
-                                    num_channels,
-                                    &node_id_recv,
-                                    &local_labels_recv.lock().map(|l| l.clone()).unwrap_or_else(|_| (0..num_channels).map(local_channel_label).collect()),
-                                ))
+                                        &device_name_token,
+                                        num_channels,
+                                        &node_id_recv,
+                                        &local_labels_recv.lock().map(|l| l.clone()).unwrap_or_else(|_| (0..num_channels).map(local_channel_label).collect()),
+                                    ))
                                         .ok();
                                     if !connected_recv.swap(true, Ordering::Relaxed) {
                                         tracing::info!("Handshake: received 09 09, sent 09 08 / 09 0a");
+                                        if let Ok(mut c) = remote_conflict_recv.lock() { *c = None; }
                                     }
                                 }
                                 HandshakePacket::Confirm { token } if token == shared_token => {
                                     if !connected_recv.swap(true, Ordering::Relaxed) {
                                         tracing::info!("Handshake: received 09 08 confirmation");
+                                        if let Ok(mut c) = remote_conflict_recv.lock() { *c = None; }
                                     }
                                 }
                                 HandshakePacket::Metadata(metadata) if metadata.channels > 0 => {
@@ -2157,6 +2390,19 @@ pub fn run_bidir(
                                         *shared_meta = Some(metadata.clone());
                                     }
                                     last_remote_metadata = Some(metadata);
+                                }
+                                HandshakePacket::RttPing { timestamp_us } => {
+                                    // Echo back immediately — do not alter the timestamp.
+                                    socket_recv.send(&build_rtt_pong(timestamp_us)).ok();
+                                }
+                                HandshakePacket::RttPong { timestamp_us } => {
+                                    let now = now_us();
+                                    if now >= timestamp_us {
+                                        let rtt_us = now - timestamp_us;
+                                        // Store as us×10 for 0.1ms resolution in a u32 atomic.
+                                        rtt_us10_recv.store((rtt_us * 10 / 1000) as u32, Ordering::Relaxed);
+                                        tracing::debug!("RTT: {:.1}ms", rtt_us as f64 / 1000.0);
+                                    }
                                 }
                                 _ => {}
                             }
@@ -2233,14 +2479,26 @@ pub fn run_bidir(
                             if !was_real {
                                 plc_count_total += 1;
                             }
-                            // No phase-lock mode intentionally keeps the old low-latency
-                            // independent-channel behaviour: decode this channel and push it
-                            // directly. ASRC is only used for phase-locked frame groups where
-                            // all active channels are processed together.
+                            // Non-phase-lock: decode immediately and resample per channel.
                             let mut peak = 0.0f32;
-                            for &s in pcm.iter() {
-                                peak = peak.max(s.abs());
-                                pb_prods[ch].try_push(s).ok();
+                            resamplers[ch].set_resample_ratio(correction_ratio, false).ok();
+                            match resamplers[ch].process(&[pcm.as_slice()], None) {
+                                Ok(out_waves) => {
+                                    for &s in out_waves[0].iter() {
+                                        peak = peak.max(s.abs());
+                                        if pb_prods[ch].try_push(s).is_err() {
+                                            ring_overflows_recv.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    for &s in pcm.iter() {
+                                        peak = peak.max(s.abs());
+                                        if pb_prods[ch].try_push(s).is_err() {
+                                            ring_overflows_recv.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
                             }
                             meters_recv.set_rx_peak(ch, peak_dbfs_from_peak(peak));
                         }
@@ -2250,6 +2508,17 @@ pub fn run_bidir(
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        // ICMP port-unreachable from remote — their socket is closed.
+                        // Unlike WouldBlock, ECONNREFUSED bypasses the recv timeout and
+                        // returns immediately, so we must sleep here or we spin at 100%
+                        // CPU and starve the audio callback. Mark disconnected so the
+                        // keepalive thread resumes probing, then sleep 100ms per retry.
+                        if connected_recv.swap(false, Ordering::Relaxed) {
+                            tracing::info!("recv: remote disconnected (ECONNREFUSED) — waiting for reconnect");
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
                     Err(e) => {
                         tracing::error!("recv: {e}");
                         continue;
@@ -2262,17 +2531,41 @@ pub fn run_bidir(
                     let (out, plc) = drain_phase_locked_groups(
                         &mut groups,
                         &mut decoders,
-                        &mut pb_prods,
                         active,
                         &mut decoded_frame,
                         &mut pcm,
+                        &mut |decoded, active_ch| {
+                            for ch in 0..active_ch {
+                                resamplers[ch].set_resample_ratio(correction_ratio, false).ok();
+                                match resamplers[ch].process(&[decoded[ch].as_slice()], None) {
+                                    Ok(out_waves) => {
+                                        let mut peak = 0.0f32;
+                                        for &s in out_waves[0].iter() {
+                                            peak = peak.max(s.abs());
+                                            if pb_prods[ch].try_push(s).is_err() {
+                                                ring_overflows_recv.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        meters_recv.set_rx_peak(ch, peak_dbfs_from_peak(peak));
+                                    }
+                                    Err(_) => {
+                                        // Fallback: direct write if resampler fails (shouldn't happen)
+                                        for &s in decoded[ch].iter() {
+                                            if pb_prods[ch].try_push(s).is_err() {
+                                                ring_overflows_recv.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
                     );
                     decoded_groups_total += out;
                     plc_count_total += plc;
                 }
 
                 let fill_ms = ring_fill_ms(&pb_prods, active);
-                let target_fill_ms = jitter.target_delay_ms.max(PRIME_SAMPLES as u32 * 1000 / SAMPLE_RATE);
+                let target_fill_ms = jitter.target_delay_ms;
 
                 // M6 baseline: phase-lock and PLC are active, but clock-drift correction
                 // is not yet applied to audio. Report drift pressure only. Target latency
@@ -2283,22 +2576,16 @@ pub fn run_bidir(
                 } else {
                     1.0
                 };
-                // Publish to output callback. Positive ppm = fill draining (insert samples).
-                // Negative ppm = fill overfilling (drop samples).
-                correction_ppm_recv.store(
-                    ((correction_ratio - 1.0) * 1_000_000.0).round() as i32,
-                    Ordering::Relaxed,
-                );
 
                 if !started_recv.load(Ordering::Relaxed)
                     && pb_prods[..active]
                         .iter()
-                        .all(|p| p.occupied_len() >= PRIME_SAMPLES)
+                        .all(|p| p.occupied_len() >= prime_samples)
                 {
                     started_recv.store(true, Ordering::Relaxed);
                     tracing::info!(
                         "All {active} receive channels primed ({}ms) — starting playback",
-                        PRIME_SAMPLES * 1000 / SAMPLE_RATE as usize
+                        prime_samples * 1000 / SAMPLE_RATE as usize
                     );
                 }
 
@@ -2321,20 +2608,17 @@ pub fn run_bidir(
                     lost_packets_at_last_stats = lost_packets_total;
                     let loss_den = media_packets_delta.saturating_add(seq_missing_delta);
                     let loss_percent = if loss_den > 0 { seq_missing_delta as f64 * 100.0 / loss_den as f64 } else { 0.0 };
+                    let rtt_raw = rtt_us10_recv.load(Ordering::Relaxed);
+                    let rtt_ms = rtt_raw as f64 / 10.0;
+                    let one_way_ms = rtt_ms / 2.0;
+                    let overflows = ring_overflows_recv.load(Ordering::Relaxed);
                     tracing::info!(
-                        "RX stats: channels={active} rx={:.3}Mbps loss={:.3}% jitter={:.2}ms fill={}ms target={}ms phase_lock={} queued_groups={} decoded_fps={:.1} output_underflows={} plc_channels={} seq_missing={} drift_pressure={}ppm",
-                        rx_mbps,
-                        loss_percent,
-                        jitter_ms_estimate,
-                        fill_ms,
-                        target_fill_ms,
-                        jitter.phase_lock,
-                        groups.len(),
-                        rx_fps,
-                        output_underflows_delta,
-                        plc_delta,
-                        seq_missing_delta,
-                        ppm
+                        "RX stats: channels={active} rx={:.3}Mbps loss={:.3}% jitter={:.2}ms fill={}ms target={}ms \
+                         phase_lock={} queued_groups={} decoded_fps={:.1} output_underflows={} plc_channels={} \
+                         seq_missing={} drift_pressure={}ppm rtt={:.1}ms one_way={:.1}ms ring_overflows={}",
+                        rx_mbps, loss_percent, jitter_ms_estimate, fill_ms, target_fill_ms,
+                        jitter.phase_lock, groups.len(), rx_fps, output_underflows_delta,
+                        plc_delta, seq_missing_delta, ppm, rtt_ms, one_way_ms, overflows
                     );
                     if let Ok(mut stats) = ui_stats_recv.lock() {
                         stats.channels = active;
@@ -2351,6 +2635,9 @@ pub fn run_bidir(
                         stats.latency_ms = fill_ms;
                         stats.rx_mbps = rx_mbps;
                         stats.drift_pressure_ppm = ppm;
+                        stats.rtt_ms = rtt_ms;
+                        stats.one_way_latency_ms = one_way_ms;
+                        stats.ring_overflows = overflows;
                         stats.rx_peak_dbfs = meters_recv.snapshot_rx(active);
                         stats.monitor_peak_dbfs = meters_recv.snapshot_monitor();
                     }
@@ -2360,15 +2647,9 @@ pub fn run_bidir(
         });
 
         // Output callback.
-        //
-        // Earlier M6 attempts rendered one 20ms block at a time and, on underrun,
-        // held/decayed the last sample. That made even tiny shortfalls sound like
-        // severe jitter on a sine wave. Render directly per output frame instead:
-        // missing samples become silence, and underruns are counted explicitly.
-        // This preserves the confirmed mixdown rules while making the failure mode
-        // a clean dropout rather than zipper/distortion noise.
-        let mut insert_accum = 0.0f64;
-        let mut last_samples = [0.0f32; MAX_CHANNELS];
+        // ASRC is now handled in the recv/decode thread via Rubato before writing to rings.
+        // This callback just pops from the rings and mixes to stereo — no sample
+        // manipulation here keeps the hot path clean and avoids phase discontinuities.
         let stream = out_device.build_output_stream(
             &out_config,
             move |data: &mut [f32], _| {
@@ -2378,10 +2659,6 @@ pub fn run_bidir(
                 }
 
                 let active_channels = remote_channels_play.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
-                // Patch-matrix mode must be truly silent until the operator makes
-                // receive crosspoints. Do not special-case mono here, because that
-                // creates an implicit ch0 -> L/R monitor route even when the UI
-                // shows an empty Receive Routing matrix.
                 let active_for_gain = meters_play.snapshot_rx(active_channels);
                 let mode = MonitorMode::from_u8(monitor_mode_play.load(Ordering::Relaxed));
                 let left_mask = output_route_masks_play[0].load(Ordering::Relaxed);
@@ -2392,42 +2669,18 @@ pub fn run_bidir(
                 let mut rx_peaks = [0.0f32; MAX_CHANNELS];
                 let mut monitor_peaks = [0.0f32; 2];
 
-                let ppm = correction_ppm_play.load(Ordering::Relaxed);
-                
                 for frame in data.chunks_exact_mut(2) {
                     let mut samples = [0.0f32; MAX_CHANNELS];
-                
-                    insert_accum += ppm as f64 * 1e-6;
-                
-                    if insert_accum >= 1.0 {
-                        // Fill is draining: insert a sample by repeating the last one.
-                        // Ring is not advanced — effective consumption rate drops by 1 sample.
-                        insert_accum -= 1.0;
-                        for ch in 0..active_channels {
-                            samples[ch] = last_samples[ch];
-                            rx_peaks[ch] = rx_peaks[ch].max(last_samples[ch].abs());
-                        }
-                        any_sample = true; // suppress spurious reprime
-                    } else {
-                        if insert_accum <= -1.0 {
-                            // Fill is overfilling: drop one extra sample per channel silently.
-                            insert_accum += 1.0;
-                            for ch in 0..active_channels {
-                                pb_conss[ch].try_pop();
+
+                    for ch in 0..active_channels {
+                        match pb_conss[ch].try_pop() {
+                            Some(v) => {
+                                any_sample = true;
+                                samples[ch] = v;
+                                rx_peaks[ch] = rx_peaks[ch].max(v.abs());
                             }
-                        }
-                        // Normal sample consumption:
-                        for ch in 0..active_channels {
-                            match pb_conss[ch].try_pop() {
-                                Some(v) => {
-                                    any_sample = true;
-                                    samples[ch] = v;
-                                    last_samples[ch] = v;
-                                    rx_peaks[ch] = rx_peaks[ch].max(v.abs());
-                                }
-                                None => {
-                                    underflowed = true;
-                                }
+                            None => {
+                                underflowed = true;
                             }
                         }
                     }
@@ -2512,7 +2765,7 @@ pub fn run_bidir(
         let tx_source_masks_send = Arc::clone(&tx_tone_source_for_send);
 
         tracing::info!(
-            "Input/test sources: active Web UI matrix router across {} network send channel(s)",
+            "Input/test sources: active Web UI send routing matrix across {} channel(s)",
             num_channels
         );
 
@@ -2533,7 +2786,7 @@ pub fn run_bidir(
                         buffer_size: ALSA_PERIOD,
                     };
                     tracing::info!(
-                        "Input: {} @ 48kHz {} channel(s) → transmit routing matrix",
+                        "Input: {} @ 48kHz {} channel(s) → send routing matrix",
                         in_device.name()?,
                         input_channels
                     );
@@ -2966,14 +3219,31 @@ fn main() -> Result<()> {
             let peer_ip = args
                 .get(2)
                 .ok_or_else(|| anyhow!(
-                    "Usage: bidir <REMOTE_IP> [--channels N] [--token TOKEN] [--id NAME] [--bitrate BPS] [--latency-ms MS] [--latency-ms N] [--fixed-jitter] [--no-phase-lock] [--web ADDR:PORT] [--no-web] [--no-send] [--no-recv]"
+                    "Usage: bidir [--remote-host IP] [--remote-name NAME] [--channels N] [--token TOKEN] [--id NAME] [--bitrate BPS] [--latency-ms MS] [--fixed-jitter] [--no-phase-lock] [--web ADDR:PORT] [--no-web] [--no-send] [--no-recv]"
                 ))?;
+
+            // Support legacy positional remote IP for backward compat with existing configs.
+            let remote_host = if !peer_ip.starts_with("--") { peer_ip.as_str() } else { "" };
+            let remote_host = {
+                let idx = args.iter().position(|a| a == "--remote-host");
+                idx.and_then(|i| args.get(i + 1)).map(|s| s.as_str()).unwrap_or(remote_host)
+            };
+
+            let remote_device_name = {
+                let idx = args.iter().position(|a| a == "--remote-name");
+                idx.and_then(|i| args.get(i + 1)).cloned().unwrap_or_default()
+            };
+
+            let link_password: Option<String> = {
+                let idx = args.iter().position(|a| a == "--link-password");
+                idx.and_then(|i| args.get(i + 1)).cloned()
+            };
 
             let num_channels = {
                 let idx = args.iter().position(|a| a == "--channels");
                 match idx.and_then(|i| args.get(i + 1)) {
                     Some(n) => n.parse::<usize>().map_err(|_| anyhow!("--channels must be 1–{MAX_CHANNELS}"))?,
-                    None => 2, // default to stereo
+                    None => 2,
                 }
             };
 
@@ -2985,7 +3255,6 @@ fn main() -> Result<()> {
             let send_enabled = !args.contains(&"--no-send".to_string());
             let recv_enabled = !args.contains(&"--no-recv".to_string());
 
-
             let node_id = {
                 let idx = args.iter().position(|a| a == "--id");
                 match idx.and_then(|i| args.get(i + 1)) {
@@ -2994,29 +3263,23 @@ fn main() -> Result<()> {
                 }
             };
 
-            let my_token = {
-                let idx = args.iter().position(|a| a == "--id");
-                match idx.and_then(|i| args.get(i + 1)) {
-                    Some(v) => parse_token_arg(v)?,
-                    None => derive_token_from_text(&node_id),
-                }
-            };
+            let device_name_token = derive_token_from_text(&node_id);
 
+            // Shared token: explicit --token overrides; otherwise derive from remote device name + optional password.
             let shared_token = {
                 let idx = args.iter().position(|a| a == "--token");
                 match idx.and_then(|i| args.get(i + 1)) {
                     Some(v) => parse_token_arg(v)?,
+                    None if !remote_device_name.is_empty() =>
+                        derive_link_token(&node_id, &remote_device_name, link_password.as_deref()),
                     None => DEFAULT_SHARED_TOKEN,
                 }
             };
 
             let configured_delay_ms = {
-                let idx = args
-                    .iter()
-                    .position(|a| a == "--latency-ms" || a == "--jitter-ms");
+                let idx = args.iter().position(|a| a == "--latency-ms" || a == "--jitter-ms");
                 match idx.and_then(|i| args.get(i + 1)) {
-                    Some(v) => v
-                        .parse::<u32>()
+                    Some(v) => v.parse::<u32>()
                         .map_err(|_| anyhow!("--latency-ms must be {MIN_LATENCY_MS}–{MAX_LATENCY_MS}"))?
                         .clamp(MIN_LATENCY_MS, MAX_LATENCY_MS),
                     None => 120,
@@ -3031,13 +3294,6 @@ fn main() -> Result<()> {
                 phase_lock: !args.contains(&"--no-phase-lock".to_string()),
             };
 
-            if let Some(idx) = args.iter().position(|a| a == "--monitor") {
-                if let Some(v) = args.get(idx + 1) {
-                    if v != "matrix" && v != "patch" && v != "patch-matrix" {
-                        tracing::warn!("--monitor {v} ignored; M7 normal operation is matrix-only");
-                    }
-                }
-            }
             let monitor_mode = MonitorMode::PatchMatrix;
 
             let opus_bitrate_per_channel = {
@@ -3056,12 +3312,13 @@ fn main() -> Result<()> {
             };
 
             run_bidir(
-                peer_ip,
+                remote_host,
+                &remote_device_name,
                 num_channels,
                 source,
                 send_enabled,
                 recv_enabled,
-                my_token,
+                device_name_token,
                 shared_token,
                 node_id,
                 jitter,
@@ -3105,10 +3362,14 @@ fn main() -> Result<()> {
                     None => persisted.channels.unwrap_or(2),
                 }.clamp(1, MAX_CHANNELS)
             };
+            let remote_device_name = persisted.remote_device_name.clone().unwrap_or_default();
+            let link_password = persisted.link_password.clone();
             let shared_token = {
                 let idx = args.iter().position(|a| a == "--token");
                 match idx.and_then(|i| args.get(i + 1)).cloned().or(persisted.token_hex.clone()) {
                     Some(v) => parse_token_arg(&v)?,
+                    None if !remote_device_name.is_empty() =>
+                        derive_link_token(&node_id, &remote_device_name, link_password.as_deref()),
                     None => DEFAULT_SHARED_TOKEN,
                 }
             };
@@ -3137,15 +3398,34 @@ fn main() -> Result<()> {
                 let idx = args.iter().position(|a| a == "--web");
                 idx.and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| "0.0.0.0:8080".to_string())
             };
-            let remote = {
-                let idx = args.iter().position(|a| a == "--remote" || a == "--device" || a == "--peer");
+            let remote_host = {
+                let idx = args.iter().position(|a| a == "--remote" || a == "--device" || a == "--remote-host");
                 idx.and_then(|i| args.get(i + 1)).cloned().or(persisted.remote.clone())
             };
 
-            if let Some(remote) = remote.filter(|r| !r.trim().is_empty()) {
-                tracing::info!("AudioLink loading persistent config from {}", persisted_state_path().display());
+            if let Some(remote_host) = remote_host.filter(|r| !r.trim().is_empty()) {
+                tracing::info!("AudioLink loading persistent config: remote_host={remote_host} remote_device={remote_device_name}");
                 run_bidir(
-                    &remote,
+                    &remote_host,
+                    &remote_device_name,
+                    num_channels,
+                    Source::Matrix,
+                    true,
+                    true,
+                    derive_token_from_text(&node_id),
+                    shared_token,
+                    node_id,
+                    jitter,
+                    Some(web_addr),
+                    MonitorMode::PatchMatrix,
+                    opus_bitrate_per_channel,
+                )
+            } else if !remote_device_name.is_empty() {
+                // Responder mode — remote device name configured but no host.
+                tracing::info!("AudioLink starting in responder mode: waiting for {remote_device_name}");
+                run_bidir(
+                    "",
+                    &remote_device_name,
                     num_channels,
                     Source::Matrix,
                     true,
@@ -3160,7 +3440,7 @@ fn main() -> Result<()> {
                 )
             } else {
                 let state = control_web_state(node_id.clone(), shared_token, num_channels, opus_bitrate_per_channel, jitter)?;
-                tracing::info!("AudioLink Web UI starting without an active remote device; open http://{web_addr} and use Setup to start the engine");
+                tracing::info!("AudioLink Web UI starting — open http://{web_addr} and use Setup to connect");
                 spawn_web_ui(web_addr, state);
                 loop { std::thread::sleep(Duration::from_secs(3600)); }
             }
