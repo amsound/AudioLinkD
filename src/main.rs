@@ -4,8 +4,7 @@ use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},
     HeapRb,
 };
-use rubato::{FastFixedIn, PolynomialDegree, Resampler};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use rubato::{FastFixedIn, PolynomialDegree, Resampler};use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::net::UdpSocket;
 use std::process::Command;
@@ -752,6 +751,7 @@ struct PersistedRuntimeConfig {
     fixed_jitter: Option<bool>,
     phase_lock: Option<bool>,
     channel_labels: Option<Vec<String>>,
+    rendezvous_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -905,6 +905,7 @@ struct RuntimeSummary {
     fixed_jitter: bool,
     phase_lock: bool,
     link_password_configured: bool,
+    rendezvous_url: String,
     web_note: String,
 }
 
@@ -1104,6 +1105,7 @@ struct SetupApplyRequest {
     channels: usize,
     opus_bitrate_per_channel: u32,
     receive_buffer_ms: u32,
+    rendezvous_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1330,14 +1332,14 @@ async fn index_handler(State(_state): State<WebState>) -> Html<String> {
 <section id="txrouting" class="page"><div class="card"><h2>Send Routing</h2><div id="txMatrix"></div></div></section>
 <section id="rxrouting" class="page"><div class="card"><h2>Receive Routing</h2><div id="rxMatrix"></div></div></section>
 <section id="meters" class="page"><div class="card"><h2>Peak Meters</h2><h3>Send</h3><div class="meterbank" id="txMeters"></div><h3>Receive</h3><div class="meterbank" id="rxMeters"></div><h3>Local Output</h3><div class="meterbank" id="monMeters"></div></div></section>
-<section id="setup" class="page"><div class="formgrid"><div class="card"><h2>Link Setup</h2><div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" placeholder="debian-vm-2"></div><div class="field"><label>Remote host IP (leave blank to wait for incoming)</label><input id="cfgPeer" autocomplete="off" placeholder="192.168.64.3 — blank = responder mode"></div><div class="field"><label>This device name</label><input id="cfgNode" autocomplete="off"></div><div class="field"><label>Link password (optional)</label><div style="display:flex;gap:6px"><input id="cfgLinkPw" autocomplete="off" type="password" placeholder="Leave blank if not required" style="flex:1"><button type="button" onclick="togglePwVis()" id="cfgLinkPwBtn" title="Show/hide password" style="padding:0 10px;font-size:1.1em">👁</button></div></div><div class="field"><label>Link token override (advanced — leave blank)</label><input id="cfgToken" autocomplete="off" spellcheck="false" placeholder="Derived automatically from device name"></div><div class="field"><label>Network send channels</label><select id="cfgChannels"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></div><div id="setupLink" class="kv"></div></div><div class="card"><h2>Codec</h2><div class="field"><label>Codec</label><select disabled><option>Opus</option></select></div><div class="field"><label>Bitrate per channel</label><select id="bitrate"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></div><div class="field"><label>Frame size</label><select disabled><option>20 ms</option></select></div><div class="field"><label>Incoming audio buffer</label><select id="rxBuffer"><option value="5">5 ms</option><option value="10">10 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="140">140 ms</option><option value="160">160 ms</option><option value="180">180 ms</option><option value="200">200 ms</option><option value="250">250 ms</option><option value="300">300 ms</option><option value="400">400 ms</option><option value="500">500 ms</option><option value="750">750 ms</option><option value="1000">1 s</option><option value="1500">1.5 s</option><option value="2000">2 s</option><option value="3000">3 s</option><option value="5000">5 s</option><option value="10000">10 s</option></select></div><div class="field"><button onclick="applySetup()">Apply and rebuild engine</button></div><pre id="restartCommand" class="cmd"></pre></div><div class="card"><h2>Audio Devices</h2><div id="devices"></div></div></div></section>
+<section id="setup" class="page"><div class="formgrid"><div class="card"><h2>Link Setup</h2><div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" placeholder="debian-vm-2"></div><div class="field"><label>Remote host IP (leave blank to wait for incoming)</label><input id="cfgPeer" autocomplete="off" placeholder="192.168.64.3 — blank = responder mode"></div><div class="field"><label>This device name</label><input id="cfgNode" autocomplete="off"></div><div class="field"><label>Link password (optional)</label><div style="display:flex;gap:6px"><input id="cfgLinkPw" autocomplete="off" type="password" placeholder="Leave blank if not required" style="flex:1"><button type="button" onclick="togglePwVis()" id="cfgLinkPwBtn" title="Show/hide password" style="padding:0 10px;font-size:1.1em">👁</button></div></div><div class="field"><label>Link token override (advanced — leave blank)</label><input id="cfgToken" autocomplete="off" spellcheck="false" placeholder="Derived automatically from device name"></div><div class="field"><label>Rendezvous server (optional — for internet connections)</label><input id="cfgRendezvous" autocomplete="off" placeholder="https://audiolink.amsound.co.uk"></div><div class="field"><label>Network send channels</label><select id="cfgChannels"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></div><div id="setupLink" class="kv"></div></div><div class="card"><h2>Codec</h2><div class="field"><label>Codec</label><select disabled><option>Opus</option></select></div><div class="field"><label>Bitrate per channel</label><select id="bitrate"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></div><div class="field"><label>Frame size</label><select disabled><option>20 ms</option></select></div><div class="field"><label>Incoming audio buffer</label><select id="rxBuffer"><option value="5">5 ms</option><option value="10">10 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="140">140 ms</option><option value="160">160 ms</option><option value="180">180 ms</option><option value="200">200 ms</option><option value="250">250 ms</option><option value="300">300 ms</option><option value="400">400 ms</option><option value="500">500 ms</option><option value="750">750 ms</option><option value="1000">1 s</option><option value="1500">1.5 s</option><option value="2000">2 s</option><option value="3000">3 s</option><option value="5000">5 s</option><option value="10000">10 s</option></select></div><div class="field"><button onclick="applySetup()">Apply and rebuild engine</button></div><pre id="restartCommand" class="cmd"></pre></div><div class="card"><h2>Audio Devices</h2><div id="devices"></div></div></div></section>
 </main>
 <script>
 let status={}, stats={}, matrix={sources:[],destinations:[],routes:[]}, devices={};
 let matrixRenderKey='', routeBusy=false, localOk=true;
 let cfgDirty={peer:false,node:false,token:false,channels:false,bitrate:false,rxBuffer:false};
 function markCfgDirty(id,key){let el=$(id); if(el) el.addEventListener('input',()=>cfgDirty[key]=true); if(el) el.addEventListener('change',()=>cfgDirty[key]=true);} 
-window.addEventListener('DOMContentLoaded',()=>{markCfgDirty('cfgRemoteName','remoteName');markCfgDirty('cfgPeer','peer');markCfgDirty('cfgNode','node');markCfgDirty('cfgLinkPw','linkPw');markCfgDirty('cfgToken','token');markCfgDirty('cfgChannels','channels');markCfgDirty('bitrate','bitrate');markCfgDirty('rxBuffer','rxBuffer');});
+window.addEventListener('DOMContentLoaded',()=>{markCfgDirty('cfgRemoteName','remoteName');markCfgDirty('cfgPeer','peer');markCfgDirty('cfgNode','node');markCfgDirty('cfgLinkPw','linkPw');markCfgDirty('cfgToken','token');markCfgDirty('cfgRendezvous','rendezvous');markCfgDirty('cfgChannels','channels');markCfgDirty('bitrate','bitrate');markCfgDirty('rxBuffer','rxBuffer');});
 const $=id=>document.getElementById(id);
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab,.page').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.page).classList.add('active')});
 function setLocalOk(ok){localOk=ok;$('localLost').className='local-lost '+(ok?'':'show')}
@@ -1370,9 +1372,9 @@ function setRemoteAlert(st){let alert=$('topAlert'), banner=$('remoteBanner');le
 function setSelectValue(id,value){let el=$(id);if(!el)return;let v=String(value);if([...el.options].some(o=>o.value===v||o.text===v))el.value=v}
 function shellQuote(v){return "'"+String(v).replace(/'/g,"'\''")+"'"}
 function showRestartCommand(){let peer=$('cfgPeer').value||status.runtime?.remote_host||'';let node=$('cfgNode').value||status.node_id||'';let remoteName=$('cfgRemoteName').value||status.runtime?.remote_device_name||'';let channels=$('cfgChannels').value||status.local_channels||2;let bitrate=$('bitrate').value||status.runtime?.opus_bitrate_per_channel||128000;let rxBuffer=$('rxBuffer').value||status.runtime?.latency_ms||120;let cmd=`audiolinkd bidir --remote-name ${shellQuote(remoteName)}${peer?' --remote-host '+shellQuote(peer.split(':')[0]):''}  --channels ${channels} --id ${shellQuote(node)} --bitrate ${bitrate} --latency-ms ${rxBuffer}`;$('restartCommand').textContent=cmd}
-async function applySetup(){let body={remote:$('cfgPeer').value,remote_device_name:$('cfgRemoteName').value,link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value),opus_bitrate_per_channel:Number($('bitrate').value),receive_buffer_ms:Number($('rxBuffer').value)};$('restartCommand').textContent='Applying…';try{let res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});let txt=await res.text();if(!res.ok){$('restartCommand').textContent=txt;return}cfgDirty={peer:false,node:false,remoteName:false,linkPw:false,token:false,channels:false,bitrate:false,rxBuffer:false};$('restartCommand').textContent='Engine rebuilding — reconnecting shortly.'}catch(e){$('restartCommand').textContent='Apply failed: '+e}}
+async function applySetup(){let body={remote:$('cfgPeer').value,remote_device_name:$('cfgRemoteName').value,link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value),opus_bitrate_per_channel:Number($('bitrate').value),receive_buffer_ms:Number($('rxBuffer').value),rendezvous_url:$('cfgRendezvous').value||undefined};$('restartCommand').textContent='Applying…';try{let res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});let txt=await res.text();if(!res.ok){$('restartCommand').textContent=txt;return}cfgDirty={peer:false,node:false,remoteName:false,linkPw:false,token:false,channels:false,bitrate:false,rxBuffer:false,rendezvous:false};$('restartCommand').textContent='Engine rebuilding — reconnecting shortly.'}catch(e){$('restartCommand').textContent='Apply failed: '+e}}
 function togglePwVis(){let f=$('cfgLinkPw');f.type=f.type==='password'?'text':'password';}
-function render(){setLocalOk(true);let dev=status.remote||{};let st=status.peer_status||'gray';let conflict=status.remote_conflict;$('peerLamp').className='lamp '+(st==='green'?'green':st==='orange'?'orange':'');let connText=st==='green'?('Connected — auto-handshake established'+(dev.node_id?' with '+dev.node_id:'')):st==='orange'?'Remote device degraded':'Remote device offline';$('peerText').textContent=connText;if(conflict){$('peerText').textContent='Connection conflict — '+conflict+' attempted to connect while already connected to '+(dev.node_id||'another device')}setRemoteAlert(st);$('nodeLine').textContent=`Node ${status.node_id||''} · ${status.monitor_mode||''}`;setKv('localKv',[['Device Name',status.node_id||'—'],['Mode','Bidirectional'],['Source',status.runtime?.source||'—'],['Network send channels',status.local_channels??'—'],['Opus bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—'],['Local inputs',status.local_input_channels??0],['Monitor',status.monitor_mode||'—']]);setKv('peerKv',[['Remote device name',dev.node_id||status.runtime?.remote_device_name||'—'],['Remote host',status.runtime?.remote_host||'—'],['RX channels',status.remote_channels??0],['Status',status.peer_status||'gray'],['Last keepalive',status.last_control_age_ms!=null?Math.round(status.last_control_age_ms/100)/10+' s ago':'—'],['Last audio',status.last_audio_age_ms!=null?Math.round(status.last_audio_age_ms/100)/10+' s ago':'—'],['Metadata',dev.labels?dev.labels.join(', '):'—']]);setKv('statsKv',[['TX rate',((stats.tx_mbps??0)).toFixed(3)+' Mb/s'],['RX rate',((stats.rx_mbps??0)).toFixed(3)+' Mb/s'],['Packet loss',((stats.loss_percent??0)).toFixed(3)+' %'],['Missing packets',stats.seq_missing??0],['Jitter',((stats.jitter_ms??0)).toFixed(2)+' ms'],['RTT',stats.rtt_ms?(stats.rtt_ms.toFixed(1)+' ms'):'not measured yet'],['Estimated one-way latency',stats.one_way_latency_ms?(stats.one_way_latency_ms.toFixed(1)+' ms'):'pending'],['Incoming audio buffer',(stats.fill_ms??0)+' ms'],['Configured buffer',(status.runtime?.latency_ms??'—')+' ms'],['Effective target buffer',(stats.target_ms??status.runtime?.effective_latency_ms??'—')+' ms'],['Estimated audio latency',stats.one_way_latency_ms&&stats.fill_ms?(((stats.one_way_latency_ms)+(stats.fill_ms??0)).toFixed(1)+' ms'):'pending'],['Drift pressure',(stats.drift_pressure_ppm??0)+' ppm'],['Decoded fps',(stats.decoded_fps??0).toFixed(1)],['TX fps',(stats.tx_fps??0).toFixed(1)],['Queued groups',stats.queued_groups??0],['Output underflows',stats.output_underflows??0],['PLC channels',stats.plc_channels??0],['Ring overflows',stats.ring_overflows??0]]);setKv('audioKv',[['Codec','Opus'],['Bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s per channel':'—'],['Frame','20 ms / 960 samples'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured / '+(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms effective'],['Phase lock',stats.phase_lock?'on':'off'],['Generator','EBU R49']]);if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.node)$('cfgNode').value=status.node_id||'';if(!cfgDirty.token)$('cfgToken').value='';if(!cfgDirty.linkPw){$('cfgLinkPw').value='';$('cfgLinkPw').placeholder=status.runtime?.link_password_configured?'Password is set — enter new password to change, or leave blank to keep':'Leave blank if not required';}if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels??2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel??128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms??120);setKv('setupLink',[['Remote device name',status.runtime?.remote_device_name||'not configured'],['Remote host (initiator only)',status.runtime?.remote_host||'blank (responder mode)'],['Current device name',status.node_id||'—'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured'],['Effective buffer',(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms'],['Config file','audiolinkd_config.json']]);$('devices').innerHTML=`<div class="kv"><span>Sample rate</span><b>${devices.sample_rate||48000} Hz</b><span>Default input</span><b>${devices.default_input||'none'}</b><span>Input channels</span><b>${devices.default_input_channels??0}</b><span>Default output</span><b>${devices.default_output||'none'}</b><span>Output channels</span><b>${devices.default_output_channels??0}</b></div><h3>Inputs</h3><p>${(devices.inputs||[]).join('<br>')||'none'}</p><h3>Outputs</h3><p>${(devices.outputs||[]).join('<br>')||'none'}</p>`;let txLabels=(matrix.destinations||[]).filter(d=>d.kind==='network_send').map(d=>d.label.replace(/^Send \d+ — /,''));let rxLabels=(matrix.sources||[]).filter(s=>s.kind==='network_receive').map(s=>s.label.replace(/^\S+ /,''));$('txMeters').innerHTML=(stats.tx_peak_dbfs||[]).map((v,i)=>meter('Send '+(i+1),v,'tx'+i,txLabels[i]||'')).join('')||'<p class="note">No send channels</p>';let remoteOnline=(st==='green'||st==='orange')&&(status.remote_channels||0)>0;$('rxMeters').innerHTML=remoteOnline?(stats.rx_peak_dbfs||[]).map((v,i)=>meter('Receive '+(i+1),v,'rx'+i,rxLabels[i]||'')).join(''):'<div class="empty-note">No connected remote device</div>';$('monMeters').innerHTML=(stats.monitor_peak_dbfs||[-120,-120]).map((v,i)=>meter(i?'Local Output 2':'Local Output 1',v,'mon'+i)).join('');renderMatrices()}
+function render(){setLocalOk(true);let dev=status.remote||{};let st=status.peer_status||'gray';let conflict=status.remote_conflict;$('peerLamp').className='lamp '+(st==='green'?'green':st==='orange'?'orange':'');let connText=st==='green'?('Connected — auto-handshake established'+(dev.node_id?' with '+dev.node_id:'')):st==='orange'?'Remote device degraded':'Remote device offline';$('peerText').textContent=connText;if(conflict){$('peerText').textContent='Connection conflict — '+conflict+' attempted to connect while already connected to '+(dev.node_id||'another device')}setRemoteAlert(st);$('nodeLine').textContent=`Node ${status.node_id||''} · ${status.monitor_mode||''}`;setKv('localKv',[['Device Name',status.node_id||'—'],['Mode','Bidirectional'],['Source',status.runtime?.source||'—'],['Network send channels',status.local_channels??'—'],['Opus bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—'],['Local inputs',status.local_input_channels??0],['Monitor',status.monitor_mode||'—']]);setKv('peerKv',[['Remote device name',dev.node_id||status.runtime?.remote_device_name||'—'],['Remote host',status.runtime?.remote_host||'—'],['RX channels',status.remote_channels??0],['Status',status.peer_status||'gray'],['Last keepalive',status.last_control_age_ms!=null?Math.round(status.last_control_age_ms/100)/10+' s ago':'—'],['Last audio',status.last_audio_age_ms!=null?Math.round(status.last_audio_age_ms/100)/10+' s ago':'—'],['Metadata',dev.labels?dev.labels.join(', '):'—']]);setKv('statsKv',[['TX rate',((stats.tx_mbps??0)).toFixed(3)+' Mb/s'],['RX rate',((stats.rx_mbps??0)).toFixed(3)+' Mb/s'],['Packet loss',((stats.loss_percent??0)).toFixed(3)+' %'],['Missing packets',stats.seq_missing??0],['Jitter',((stats.jitter_ms??0)).toFixed(2)+' ms'],['RTT',stats.rtt_ms?(stats.rtt_ms.toFixed(1)+' ms'):'not measured yet'],['Estimated one-way latency',stats.one_way_latency_ms?(stats.one_way_latency_ms.toFixed(1)+' ms'):'pending'],['Incoming audio buffer',(stats.fill_ms??0)+' ms'],['Configured buffer',(status.runtime?.latency_ms??'—')+' ms'],['Effective target buffer',(stats.target_ms??status.runtime?.effective_latency_ms??'—')+' ms'],['Estimated audio latency',stats.one_way_latency_ms&&stats.fill_ms?(((stats.one_way_latency_ms)+(stats.fill_ms??0)).toFixed(1)+' ms'):'pending'],['Drift pressure',(stats.drift_pressure_ppm??0)+' ppm'],['Decoded fps',(stats.decoded_fps??0).toFixed(1)],['TX fps',(stats.tx_fps??0).toFixed(1)],['Queued groups',stats.queued_groups??0],['Output underflows',stats.output_underflows??0],['PLC channels',stats.plc_channels??0],['Ring overflows',stats.ring_overflows??0]]);setKv('audioKv',[['Codec','Opus'],['Bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s per channel':'—'],['Frame','20 ms / 960 samples'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured / '+(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms effective'],['Phase lock',stats.phase_lock?'on':'off'],['Generator','EBU R49']]);if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.node)$('cfgNode').value=status.node_id||'';if(!cfgDirty.token)$('cfgToken').value='';if(!cfgDirty.rendezvous)$('cfgRendezvous').value=status.runtime?.rendezvous_url||'';if(!cfgDirty.linkPw){$('cfgLinkPw').value='';$('cfgLinkPw').placeholder=status.runtime?.link_password_configured?'Password is set — enter new password to change, or leave blank to keep':'Leave blank if not required';}if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels??2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel??128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms??120);setKv('setupLink',[['Remote device name',status.runtime?.remote_device_name||'not configured'],['Remote host (initiator only)',status.runtime?.remote_host||'blank (responder mode)'],['Rendezvous server',status.runtime?.rendezvous_url||'not configured'],['Current device name',status.node_id||'—'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured'],['Effective buffer',(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms'],['Config file','audiolinkd_config.json']]);$('devices').innerHTML=`<div class="kv"><span>Sample rate</span><b>${devices.sample_rate||48000} Hz</b><span>Default input</span><b>${devices.default_input||'none'}</b><span>Input channels</span><b>${devices.default_input_channels??0}</b><span>Default output</span><b>${devices.default_output||'none'}</b><span>Output channels</span><b>${devices.default_output_channels??0}</b></div><h3>Inputs</h3><p>${(devices.inputs||[]).join('<br>')||'none'}</p><h3>Outputs</h3><p>${(devices.outputs||[]).join('<br>')||'none'}</p>`;let txLabels=(matrix.destinations||[]).filter(d=>d.kind==='network_send').map(d=>d.label.replace(/^Send \d+ — /,''));let rxLabels=(matrix.sources||[]).filter(s=>s.kind==='network_receive').map(s=>s.label.replace(/^\S+ /,''));$('txMeters').innerHTML=(stats.tx_peak_dbfs||[]).map((v,i)=>meter('Send '+(i+1),v,'tx'+i,txLabels[i]||'')).join('')||'<p class="note">No send channels</p>';let remoteOnline=(st==='green'||st==='orange')&&(status.remote_channels||0)>0;$('rxMeters').innerHTML=remoteOnline?(stats.rx_peak_dbfs||[]).map((v,i)=>meter('Receive '+(i+1),v,'rx'+i,rxLabels[i]||'')).join(''):'<div class="empty-note">No connected remote device</div>';$('monMeters').innerHTML=(stats.monitor_peak_dbfs||[-120,-120]).map((v,i)=>meter(i?'Local Output 2':'Local Output 1',v,'mon'+i)).join('');renderMatrices()}
 async function loadDevices(){try{devices=await fetch('/api/audio/devices').then(r=>r.json())}catch(e){console.error(e)}}
 async function poll(){try{[status,stats,matrix]=await Promise.all([fetch('/api/status').then(r=>r.json()),fetch('/api/stats').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);render()}catch(e){console.error(e);setLocalOk(false)}}
 loadDevices().then(poll);setInterval(poll,100);
@@ -1554,6 +1556,10 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
         args.push("--link-password".to_string());
         args.push(link_password.to_string());
     }
+    if let Some(url) = req.rendezvous_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        args.push("--rendezvous".to_string());
+        args.push(url.to_string());
+    }
     if state.runtime.fixed_jitter { args.push("--fixed-jitter".to_string()); }
     if !state.runtime.phase_lock { args.push("--no-phase-lock".to_string()); }
     if !state.runtime.send_enabled { args.push("--no-send".to_string()); }
@@ -1598,6 +1604,7 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
         fixed_jitter: Some(state.runtime.fixed_jitter),
         phase_lock: Some(state.runtime.phase_lock),
         channel_labels: None, // preserved by save_persisted_config — not overwritten here
+        rendezvous_url: req.rendezvous_url.clone().filter(|u| !u.trim().is_empty()),
     });
 
     let role = if remote.is_empty() { "responder (waiting for incoming)" } else { "initiator" };
@@ -1731,6 +1738,7 @@ fn control_web_state(node_id: String, shared_token: [u8; 16], send_channels: usi
             phase_lock: jitter.phase_lock,
             web_note: "Web control is running. Configure a remote device and apply to start the audio/network engine.".into(),
             link_password_configured: false,
+            rendezvous_url: String::new(),
         },
         devices,
         restart_lock: Arc::new(Mutex::new(())),
@@ -1968,19 +1976,20 @@ fn spawn_web_ui(addr: String, state: WebState) {
 // ─── Bidirectional mode (M3/M4) ───────────────────────────────────────────────
 
 pub fn run_bidir(
-    remote_host: &str,          // IP/hostname of remote — empty string = responder mode
-    remote_device_name: &str,   // Device name of remote — used to derive link token
+    remote_host: &str,
+    remote_device_name: &str,
     num_channels: usize,
     _source: Source,
     send_enabled: bool,
     recv_enabled: bool,
-    device_name_token: [u8; 16], // derive_token_from_text(my own node_id) — sent in probe as "who I am"
-    shared_token: [u8; 16],      // link token — authentication
+    device_name_token: [u8; 16],
+    shared_token: [u8; 16],
     node_id: String,
     jitter: JitterConfig,
     web_addr: Option<String>,
     monitor_mode: MonitorMode,
     opus_bitrate_per_channel: u32,
+    rendezvous_url: Option<String>,
 ) -> Result<()> {
     if num_channels == 0 || num_channels > MAX_CHANNELS {
         return Err(anyhow!("Channel count must be 1–{MAX_CHANNELS}"));
@@ -2064,6 +2073,7 @@ pub fn run_bidir(
             phase_lock: jitter.phase_lock,
             web_note: "Setup Apply performs a controlled process rebuild so the UDP socket, Opus encoders, metadata and routing state are recreated cleanly.".into(),
             link_password_configured: load_persisted_state().config.link_password.map(|p| !p.is_empty()).unwrap_or(false),
+            rendezvous_url: rendezvous_url.clone().unwrap_or_default(),
         },
         devices: Arc::clone(&devices),
         restart_lock: Arc::new(Mutex::new(())),
@@ -2119,6 +2129,84 @@ pub fn run_bidir(
                 std::thread::sleep(std::time::Duration::from_millis(2130));
             }
         });
+    }
+
+    // M9 rendezvous: registration keepalive + inbound connect event listener.
+    // No-op if rendezvous_url is None — existing direct-IP behaviour is unchanged.
+    if let Some(rdv_url) = rendezvous_url.clone().filter(|u| !u.trim().is_empty()) {
+        let rdv_base = {
+            let u = rdv_url.trim_end_matches('/');
+            if u.starts_with("http://") || u.starts_with("https://") {
+                u.to_string()
+            } else {
+                format!("https://{u}")
+            }
+        };
+
+        // Registration keepalive — POST /api/register every 10 seconds.
+        let reg_name = node_id.clone();
+        let reg_base = rdv_base.clone();
+        std::thread::spawn(move || {
+            let body = serde_json::json!({ "name": reg_name, "port": PORT }).to_string();
+            loop {
+                match ureq::post(&format!("{reg_base}/api/register"))
+                    .set("Content-Type", "application/json")
+                    .send_string(&body)
+                {
+                    Ok(_) => tracing::debug!("rendezvous: registered {reg_name}"),
+                    Err(e) => tracing::warn!("rendezvous: register failed: {e}"),
+                }
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+
+        // Long-poll event listener — GET /api/events/{name}.
+        // When a connect event arrives, late-connect the socket and fire a probe
+        // to begin NAT hole punching simultaneously with the remote device.
+        let event_name = node_id.clone();
+        let event_socket = Arc::clone(&socket);
+        let event_established = Arc::clone(&established_addr);
+        let event_probe_token = device_name_token;
+        let event_shared_token = shared_token;
+        std::thread::spawn(move || {
+            loop {
+                let url = format!("{rdv_base}/api/events/{event_name}");
+                match ureq::get(&url).call() {
+                    Ok(resp) if resp.status() == 200 => {
+                        if let Ok(text) = resp.into_string() {
+                            if let Ok(evt) = serde_json::from_str::<serde_json::Value>(&text) {
+                                let from_name = evt["from_name"].as_str().unwrap_or("unknown");
+                                let from_addr = evt["from_addr"].as_str().unwrap_or("");
+                                if from_addr.is_empty() { continue; }
+                                tracing::info!("rendezvous: inbound connect from {from_name} @ {from_addr}");
+                                if let Ok(addr) = from_addr.parse::<std::net::SocketAddr>() {
+                                    let already = event_established.lock()
+                                        .map(|e| e.is_some()).unwrap_or(false);
+                                    if !already {
+                                        if event_socket.connect(addr).is_ok() {
+                                            if let Ok(mut e) = event_established.lock() {
+                                                *e = Some(addr);
+                                            }
+                                            tracing::info!("rendezvous: late-connected to {addr}");
+                                        }
+                                    }
+                                    let probe = build_probe_packet(&event_probe_token, &event_shared_token);
+                                    event_socket.send(&probe).ok();
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {} // 204 No Content = timeout, reconnect immediately
+                    Err(e) => {
+                        tracing::warn!("rendezvous: events poll failed: {e}");
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+
+        tracing::info!("M9 rendezvous: registered with {rdv_url} as {node_id}");
     }
 
     let host = cpal::default_host();
@@ -3311,6 +3399,11 @@ fn main() -> Result<()> {
                 Some(idx.and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| "0.0.0.0:8080".to_string()))
             };
 
+            let rendezvous_url = {
+                let idx = args.iter().position(|a| a == "--rendezvous");
+                idx.and_then(|i| args.get(i + 1)).cloned()
+            };
+
             run_bidir(
                 remote_host,
                 &remote_device_name,
@@ -3325,6 +3418,7 @@ fn main() -> Result<()> {
                 web_addr,
                 monitor_mode,
                 opus_bitrate_per_channel,
+                rendezvous_url,
             )
         }
 
@@ -3402,6 +3496,12 @@ fn main() -> Result<()> {
                 let idx = args.iter().position(|a| a == "--remote" || a == "--device" || a == "--remote-host");
                 idx.and_then(|i| args.get(i + 1)).cloned().or(persisted.remote.clone())
             };
+            let rendezvous_url = {
+                let idx = args.iter().position(|a| a == "--rendezvous");
+                idx.and_then(|i| args.get(i + 1)).cloned()
+                    .or(persisted.rendezvous_url.clone())
+                    .filter(|u| !u.trim().is_empty())
+            };
 
             if let Some(remote_host) = remote_host.filter(|r| !r.trim().is_empty()) {
                 tracing::info!("AudioLink loading persistent config: remote_host={remote_host} remote_device={remote_device_name}");
@@ -3419,9 +3519,9 @@ fn main() -> Result<()> {
                     Some(web_addr),
                     MonitorMode::PatchMatrix,
                     opus_bitrate_per_channel,
+                    rendezvous_url,
                 )
             } else if !remote_device_name.is_empty() {
-                // Responder mode — remote device name configured but no host.
                 tracing::info!("AudioLink starting in responder mode: waiting for {remote_device_name}");
                 run_bidir(
                     "",
@@ -3437,6 +3537,7 @@ fn main() -> Result<()> {
                     Some(web_addr),
                     MonitorMode::PatchMatrix,
                     opus_bitrate_per_channel,
+                    rendezvous_url,
                 )
             } else {
                 let state = control_web_state(node_id.clone(), shared_token, num_channels, opus_bitrate_per_channel, jitter)?;
