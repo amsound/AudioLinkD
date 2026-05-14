@@ -1452,7 +1452,7 @@ fn matrix_for_state(state: &WebState) -> MatrixResponse {
             .unwrap_or_else(|| format!("Ch {}", ch + 1));
         sources.push(Endpoint {
             id: format!("peer:remote:ch:{ch}"),
-            label: format!("{device_name} {label}"),
+            label: format!("{device_name} • {label}"),
             kind: "network_receive".into(),
         });
     }
@@ -1474,9 +1474,7 @@ fn matrix_for_state(state: &WebState) -> MatrixResponse {
     }
     let routes = state.routes.lock().map(|r| r.clone()).unwrap_or_default();
     MatrixResponse { monitor_mode: state.monitor_mode(), sources, destinations, routes }
-}
-
-async fn index_handler(State(_state): State<WebState>) -> Html<String> {
+}async fn index_handler(State(_state): State<WebState>) -> Html<String> {
     Html(r##"<!doctype html>
 <html lang="en-GB">
 <head>
@@ -1554,7 +1552,7 @@ details[open] summary::before{transform:rotate(90deg)}
 .mbank{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;padding:4px 0}
 .meter{display:flex;flex-direction:column;align-items:center;gap:5px;flex-shrink:0}
 .bartrack{width:22px;height:220px;position:relative;border-radius:3px;border:1px solid var(--line);overflow:hidden;background:var(--bg);transition:background .2s,border-color .2s}
-.bartrack::after{content:'';position:absolute;inset:0;pointer-events:none;z-index:3;background:linear-gradient(to top,transparent calc(70% - .5px),rgba(255,255,255,.2) calc(70% - .5px),rgba(255,255,255,.2) calc(70% + .5px),transparent calc(70% + .5px)),linear-gradient(to top,transparent calc(83.3% - .5px),rgba(255,255,255,.15) calc(83.3% - .5px),rgba(255,255,255,.15) calc(83.3% + .5px),transparent calc(83.3% + .5px))}
+.bartrack::after{content:'';position:absolute;inset:0;pointer-events:none;z-index:3;background:linear-gradient(to top,transparent calc(70% - .5px),rgba(255,255,255,.2) calc(70% - .5px),rgba(255,255,255,.2) calc(70% + .5px),transparent calc(70% + .5px)),linear-gradient(to top,transparent calc(83.3% - .5px),rgba(255,255,255,.15) calc(83.3% - .5px),rgba(255,255,255,.15) calc(83.3% + .5px),transparent calc(83.3% + .5px))}body.light .bartrack::after{background:linear-gradient(to top,transparent calc(70% - .5px),rgba(0,0,0,.25) calc(70% - .5px),rgba(0,0,0,.25) calc(70% + .5px),transparent calc(70% + .5px)),linear-gradient(to top,transparent calc(83.3% - .5px),rgba(0,0,0,.2) calc(83.3% - .5px),rgba(0,0,0,.2) calc(83.3% + .5px),transparent calc(83.3% + .5px))}
 .sg,.so,.sr{position:absolute;left:0;right:0;transition:height .05s linear,bottom .05s linear}
 .sg{background:var(--green);bottom:0;z-index:1}.so{background:var(--orange);z-index:2}.sr{background:var(--red);z-index:2}
 .barticks{position:absolute;right:calc(100% + 5px);top:0;bottom:0;width:26px;pointer-events:none}
@@ -1573,14 +1571,16 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
 .mx th,.mx td{border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
 .mx td.rh,.mx th.rh{position:sticky;left:0;z-index:2;background:var(--panel2);width:230px;min-width:230px;padding:0;transition:background .2s}
 .mx thead th.rh{z-index:5;top:0}
-.mx thead th:not(.rh){position:sticky;top:0;z-index:3;background:var(--panel2);width:36px;min-width:36px;max-width:36px;padding:0;vertical-align:bottom;transition:background .2s}
-.ch-hdr{display:flex;flex-direction:column;align-items:center;padding:5px 1px 4px;gap:2px;min-height:48px;justify-content:flex-end}
-.ch-hdr-num{font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.04em}
-.ch-hdr-lbl{font-size:9px;color:var(--ink);font-weight:600;width:34px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;min-height:12px}
+.mx thead th:not(.rh){position:sticky;top:0;z-index:3;background:var(--panel2);width:60px;min-width:60px;max-width:60px;padding:0;vertical-align:bottom;transition:background .2s}
+.ch-hdr{display:flex;flex-direction:column;align-items:center;padding:6px 2px 5px;gap:2px;min-height:56px;justify-content:flex-end}
+.ch-hdr-num{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.04em}
+.ch-hdr-lbl{font-size:11px;color:var(--ink);font-weight:600;width:56px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;min-height:12px}
 .src-row{display:flex;align-items:center;gap:5px;padding:0 8px;height:36px;white-space:nowrap;overflow:hidden}
-.rsig{display:inline-block;width:6px;height:6px;border-radius:50%;background:#2e3e4e;flex-shrink:0}
-.rsig.live{background:var(--green)}
-.src-sysname{font-size:12px;font-weight:600;flex-shrink:0;overflow:hidden;text-overflow:ellipsis}
+.rsig{display:inline-block;width:7px;height:7px;border-radius:50%;background:#2e3e4e;flex-shrink:0;transition:background .15s}
+.rsig.green{background:var(--green);box-shadow:0 0 4px var(--green)}
+.rsig.orange{background:var(--orange)}
+.rsig.red{background:var(--red)}
+.src-sysname{font-size:13px;font-weight:600;flex-shrink:0;overflow:hidden;text-overflow:ellipsis}
 .src-sep{color:var(--muted);font-size:11px;flex-shrink:0}
 .src-label-input{flex:1;min-width:40px;max-width:120px;padding:1px 5px;font-size:11px;font-weight:600;background:transparent;border:1px solid transparent;border-radius:5px;color:var(--ink);transition:border-color .12s,background .12s}
 .src-label-input:focus{background:var(--panel);border-color:var(--blue);outline:none}
@@ -1588,7 +1588,7 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
 .src-label-input::placeholder{color:var(--line)}
 .mx tr.src-spacer td{height:10px;background:var(--bg);border-right:none;pointer-events:none}
 .mx tr.src-spacer td.rh{background:var(--bg)}
-.xcell{width:36px;min-width:36px;max-width:36px;height:36px;background:var(--cell);cursor:pointer;padding:0;transition:filter .06s}
+.xcell{width:60px;min-width:60px;max-width:60px;height:60px;background:var(--cell);cursor:pointer;padding:0;transition:filter .06s}
 .xcell.on{background:var(--green)}
 .mx tr.hl-row > .rh{background:rgba(77,159,255,.12)!important}
 .mx tr.hl-row > .xcell:not(.on){background:rgba(77,159,255,.10)!important}
@@ -1677,7 +1677,7 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
     <div class="ctitle">Incoming Buffer</div>
     <div class="bufrow"><span class="bufms" id="fillMs">—</span><span class="bufmeta">ms · target <b id="targetMs" style="color:var(--ink)">—</b> ms</span></div>
     <div class="buftrack"><div class="buffill" id="bufFill" style="width:0"></div><div class="buftick" id="bufTick" style="left:100%"></div></div>
-    <div class="bufleg"><span>0</span><span id="bufTickLbl">—</span><span>200 ms</span></div>
+    <div class="bufleg" id="bufLeg" style="position:relative;height:14px"><span style="position:absolute;left:0">0</span><span id="bufTickLbl" style="position:absolute;transform:translateX(-50%)">—</span><span id="bufLegMax" style="position:absolute;right:0">— ms</span></div>
   </div>
   <div class="card">
     <div class="ctitle">Transport</div>
@@ -1708,6 +1708,7 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
   <div class="route-toolbar">
     <button class="route-btn" id="txBtn1to1" onclick="routeConfirm('txBtn1to1',doTx1to1)">1:1</button>
     <button class="route-btn" id="txBtnClear" onclick="routeConfirm('txBtnClear',doTxClear)">Clear all</button>
+    <button class="route-btn" id="txBtnResetLabels" onclick="routeConfirm('txBtnResetLabels',doResetLabels)" style="margin-left:auto">Reset labels</button>
   </div>
   <div class="matrix-outer"><table class="mx" id="txTable"><thead id="txHead"></thead><tbody id="txBody"></tbody></table></div>
 </section>
@@ -1731,7 +1732,7 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
         <label>Device name</label>
         <div class="idrow">
           <input id="cfgNode" autocomplete="off" spellcheck="false" oninput="nodeNameDirty()">
-          <button class="cpybtn" onclick="copyFeedback(this,$('cfgNode').value)">⎘</button>
+          <button class="cpybtn" onclick="copyFeedback(this,$('cfgNode').value)">Copy</button>
           <button class="savebtn" id="nodeNameSave" onclick="saveNodeName()">Save</button>
         </div>
       </div>
@@ -1739,14 +1740,14 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
         <label>Device IP</label>
         <div class="idrow">
           <input id="deviceIpInput" readonly style="flex:1;color:var(--muted)">
-          <button class="cpybtn" onclick="copyFeedback(this,$('deviceIpInput').value)">⎘</button>
+          <button class="cpybtn" onclick="copyFeedback(this,$('deviceIpInput').value)">Copy</button>
         </div>
       </div>
     </div>
     <div class="card">
       <div class="ctitle">Connect To</div>
-      <div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.remoteName=true"></div>
-      <div class="field" style="margin-bottom:0"><label>Remote IP</label><input id="cfgPeer" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.peer=true"></div>
+      <div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.remoteName=true" style="font-family:var(--mono);font-size:13px;font-weight:600"></div>
+      <div class="field" style="margin-bottom:0"><label>Remote IP</label><input id="cfgPeer" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.peer=true" style="font-family:var(--mono);font-size:13px;font-weight:600"></div>
     </div>
   </div>
   <div class="sgrid mb" style="align-items:stretch">
@@ -1766,8 +1767,8 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
         <label>Link password</label>
         <div style="display:flex;gap:6px"><input id="cfgLinkPw" type="password" style="flex:1" oninput="cfgDirty.linkPw=true"><button id="pwToggleBtn" onclick="togglePw()" style="padding:7px 12px;flex-shrink:0;min-width:52px">Show</button></div>
       </div>
-      <div class="field"><label>Token override</label><input id="cfgToken" autocomplete="off" spellcheck="false" placeholder="auto-derived" oninput="cfgDirty.token=true"></div>
-      <div class="field" style="margin-bottom:0"><label>Rendezvous server</label><input id="cfgRendezvous" autocomplete="off" oninput="cfgDirty.rendezvous=true"></div>
+      <div class="field"><label>Token override</label><input id="cfgToken" autocomplete="off" spellcheck="false"></div>
+      <div class="field" style="margin-bottom:0"><label>Rendezvous server</label><input id="cfgRendezvous" value="https://audiolink.amsound.co.uk" autocomplete="off" oninput="cfgDirty.rendezvous=true"></div>
     </div>
   </div>
   <div class="card"><div class="ctitle">Audio Devices</div><div id="devices"><div style="color:var(--muted);font-size:12px">Loading…</div></div></div>
@@ -1786,16 +1787,19 @@ const savedTheme=localStorage.getItem('al-theme');
 applyTheme(savedTheme?savedTheme==='dark':mq.matches,false);
 mq.addEventListener('change',e=>{if(!localStorage.getItem('al-theme'))applyTheme(e.matches,false)});
 function toggleTheme(){applyTheme(!dark,true)}
-// State
+// App state
 let status={},stats={},matrix={sources:[],destinations:[],routes:[]},devices={};
 let cfgDirty={};
 let savedNodeName='';
 let matrixLastKey='';
 let routeBusy=false;
 const armTimers={};
+// srcUserLabels: user-assigned labels keyed by source endpoint id e.g. "input:0"
+// This is the source of truth on the client. Persists across matrix rebuilds.
+const srcUserLabels={};
 // Helpers
 function setSelectValue(id,value){const el=$(id);if(!el)return;const v=String(value);if([...el.options].some(o=>o.value===v||o.text===v))el.value=v}
-function copyFeedback(btn,text){navigator.clipboard?.writeText(text).then(()=>{btn.textContent='✓';setTimeout(()=>btn.textContent='⎘',1500)})}
+function copyFeedback(btn,text){function done(){btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',1800)}function fail(){btn.textContent='Failed';setTimeout(()=>btn.textContent='Copy',1800)}function execCopy(){try{const t=document.createElement('textarea');t.value=text;t.style.cssText='position:fixed;opacity:0;top:0;left:0';document.body.appendChild(t);t.focus();t.select();document.execCommand('copy');document.body.removeChild(t);done()}catch(e){fail()}}if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(text).then(done).catch(execCopy)}else{execCopy()}}
 function rttCls(ms){return ms>100?'bad':ms>40?'warn':'ok'}
 function lossCls(p){return p>2?'bad':p>.5?'warn':'ok'}
 // Double-tap confirm
@@ -1806,56 +1810,250 @@ function nodeNameDirty(){cfgDirty.node=true;$('nodeNameSave').classList.toggle('
 function saveNodeName(){const n=$('cfgNode').value.trim();if(!n)return;savedNodeName=n;$('nodeNameSave').classList.remove('show');$('nodeLine').textContent=n}
 function togglePw(){const f=$('cfgLinkPw'),b=$('pwToggleBtn');f.type=f.type==='password'?'text':'password';b.textContent=f.type==='password'?'Show':'Hide'}
 async function applySetup(){const btn=$('applyBtn');if(btn.classList.contains('done'))return;if(btn.classList.contains('arm')){clearTimeout(btn._armTimer);btn.classList.remove('arm');btn.disabled=true;btn.textContent='Rebuilding…';const body={remote:$('cfgPeer').value||'',remote_device_name:$('cfgRemoteName').value||'',link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value||savedNodeName,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value)||2,opus_bitrate_per_channel:Number($('bitrate').value)||128000,receive_buffer_ms:Number($('rxBuffer').value)||120,rendezvous_url:$('cfgRendezvous').value||undefined,phase_lock:$('cfgPhaseLock').checked,encoder_mode:$('cfgEncoderMode').value};try{const res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const txt=await res.text();if(res.ok){btn.textContent='✓ Engine rebuilding';btn.classList.add('done');btn.disabled=false;setTimeout(()=>{btn.classList.remove('done');btn.textContent='Apply & rebuild engine'},3000)}else{btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+txt)}}catch(e){btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+e)}}else{btn.classList.add('arm');btn.textContent='Confirm rebuild';btn._armTimer=setTimeout(()=>{btn.classList.remove('arm');btn.textContent='Apply & rebuild engine'},3000)}}
-function updateSetupFromStatus(){if(!cfgDirty.node){$('cfgNode').value=status.node_id||'';if(!savedNodeName)savedNodeName=status.node_id||''}if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.rendezvous)$('cfgRendezvous').value=status.runtime?.rendezvous_url||'';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels||2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel||128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms||120);if(!cfgDirty.encoderMode)setSelectValue('cfgEncoderMode',status.runtime?.encoder_mode||'music');if(!cfgDirty.phaseLock){const pl=$('cfgPhaseLock');if(pl)pl.checked=status.runtime?.phase_lock!==false}updateMode()}
-// Home render
-function render(){const st=status.peer_status||'gray';const remote=status.remote||{};const badge=$('connBadge'),lamp=$('peerLamp'),pt=$('peerText');if(st==='green'){badge.className='conn-badge green';lamp.className='lamp green';pt.textContent='Connected — '+(remote.node_id||'remote device');$('alertbar').className='alertbar'}else if(st==='orange'){badge.className='conn-badge orange';lamp.className='lamp orange';pt.textContent='Remote device degraded';$('alertbar').className='alertbar degraded show';$('alertbar').textContent='REMOTE DEVICE DEGRADED'}else{badge.className='conn-badge gray';lamp.className='lamp gray';pt.textContent='No connected device';$('alertbar').className='alertbar offline show';$('alertbar').textContent='REMOTE DEVICE OFFLINE'}
-$('localName').textContent=status.node_id||'—';$('nodeLine').textContent=status.node_id||'—';$('localCh').textContent=(status.local_channels||0)+' ch';$('localBr').textContent=status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—';$('localCodec').textContent=status.runtime?.encoder_mode||'music';const plc=$('localPl');if(status.runtime?.phase_lock!==false){plc.textContent='phase lock';plc.className='nsub-chip live'}else{plc.textContent='no phase lock';plc.className='nsub-chip'}
-const rn=$('remoteNameHome');if(st!=='gray'){rn.textContent=remote.node_id||status.runtime?.remote_device_name||'—';rn.style.color='var(--ink)';const chips=[];if((remote.channels||0)>0)chips.push(remote.channels+' ch RX');if(remote.labels?.length>0)chips.push(remote.labels.slice(0,4).join(', ')+(remote.labels.length>4?'…':''));$('remoteChips').innerHTML=chips.map(c=>`<span class="nsub-chip">${esc(c)}</span>`).join('')}else{rn.textContent='—';rn.style.color='var(--muted)';$('remoteChips').innerHTML=''}
-const ow=stats.one_way_latency_ms||0;$('owVal').innerHTML=ow.toFixed(1)+'<span class="u"> ms</span>';$('owVal').className='sval '+rttCls(ow);$('txBw').textContent=(stats.tx_mbps||0).toFixed(3);$('rxBw').textContent=(stats.rx_mbps||0).toFixed(3);const loss=stats.loss_percent||0;$('lossVal').innerHTML=loss.toFixed(2)+'<span class="u"> %</span>';$('lossVal').className='sval '+lossCls(loss);const jit=stats.jitter_ms||0;$('jitterVal').innerHTML=jit.toFixed(1)+'<span class="u"> ms</span>';$('jitterVal').className='sval '+(jit>20?'warn':'ok');
-const fill=stats.fill_ms||0,target=stats.target_ms||status.runtime?.latency_ms||120,MAX=200;const fp=Math.min(100,fill/MAX*100),tp=Math.min(100,target/MAX*100);const bf=$('bufFill');bf.style.width=fp+'%';bf.className='buffill'+(fill<20?' bad':fill<60?' warn':'');$('bufTick').style.left=tp+'%';$('bufTickLbl').textContent=target+' ms';$('fillMs').textContent=fill.toFixed?fill.toFixed(0):fill;$('targetMs').textContent=target;
-$('tMode').textContent=status.runtime?.remote_host?'direct':'cloud';$('tHost').textContent=status.runtime?.remote_host||'—';
-$('dRtt').textContent=(stats.rtt_ms||0).toFixed(1)+' ms';$('dOwLat').textContent=(stats.one_way_latency_ms||0).toFixed(1)+' ms';const d=stats.drift_pressure_ppm||0;$('dDrift').textContent=(d>=0?'+':'')+d+' ppm';$('dFps').textContent=(stats.decoded_fps||0).toFixed(1);$('dTxFps').textContent=(stats.tx_fps||0).toFixed(1);$('dQ').textContent=stats.queued_groups||0;$('dOv').textContent=stats.ring_overflows||0;$('dPlc').textContent=stats.plc_channels||0;$('dMiss').textContent=stats.seq_missing||0;$('dSug').textContent=stats.recommended_buffer_ms?stats.recommended_buffer_ms+' ms':'—';$('dUf').textContent=stats.output_underflows||0;$('dUp').textContent=(status.uptime_seconds||0)+' s';
-renderMeters();updateSetupFromStatus()}
-// Meters
+function updateSetupFromStatus(){if(!cfgDirty.node){$('cfgNode').value=status.node_id||'';if(!savedNodeName)savedNodeName=status.node_id||''}if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.rendezvous)$('cfgRendezvous').value=status.runtime?.rendezvous_url||'https://audiolink.amsound.co.uk';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels||2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel||128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms||120);if(!cfgDirty.encoderMode)setSelectValue('cfgEncoderMode',status.runtime?.encoder_mode||'music');if(!cfgDirty.phaseLock){const pl=$('cfgPhaseLock');if(pl)pl.checked=status.runtime?.phase_lock!==false}updateMode()}
+// ── Signal lamp helpers ──────────────────────────────────────────────────────
+// Returns dBFS for a source from current stats
+function sourceDb(srcId){
+  if(srcId.startsWith('input:')){const ch=parseInt(srcId.slice(6));return(stats.input_peak_dbfs||[])[ch]??-120}
+  if(srcId==='ebu:l'){// EBU L: -18dBFS with 250ms silence every 3s
+    const pos=(Date.now()%3000);return pos<250?-120:-18}
+  if(srcId==='ebu:r')return -18;
+  if(srcId.startsWith('peer:remote:ch:')){const ch=parseInt(srcId.split(':').pop());return(stats.rx_peak_dbfs||[])[ch]??-120}
+  return -120}
+function lampClass(db){if(db>-10)return'red';if(db>-18)return'orange';if(db>-90)return'green';return''}
+// Update all rsig lamps without rebuilding the table
+function updateSignalLamps(){
+  document.querySelectorAll('[data-src-id]').forEach(el=>{
+    const db=sourceDb(el.dataset.srcId);
+    el.className='rsig '+lampClass(db)})}
+// ── Home render ──────────────────────────────────────────────────────────────
+function render(){
+  const st=status.peer_status||'gray';
+  const remote=status.remote||{};
+  const badge=$('connBadge'),lamp=$('peerLamp'),pt=$('peerText');
+  if(st==='green'){badge.className='conn-badge green';lamp.className='lamp green';pt.textContent='Connected — '+(remote.node_id||'remote device');$('alertbar').className='alertbar'}
+  else if(st==='orange'){badge.className='conn-badge orange';lamp.className='lamp orange';pt.textContent='Remote device degraded';$('alertbar').className='alertbar degraded show';$('alertbar').textContent='REMOTE DEVICE DEGRADED'}
+  else{badge.className='conn-badge gray';lamp.className='lamp gray';pt.textContent='No connected device';$('alertbar').className='alertbar offline show';$('alertbar').textContent='REMOTE DEVICE OFFLINE'}
+  $('localName').textContent=status.node_id||'—';$('nodeLine').textContent=status.node_id||'—';
+  $('localCh').textContent=(status.local_channels||0)+' ch';$('localBr').textContent=status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—';
+  $('localCodec').textContent=status.runtime?.encoder_mode||'music';
+  const plc=$('localPl');if(status.runtime?.phase_lock!==false){plc.textContent='phase lock';plc.className='nsub-chip live'}else{plc.textContent='no phase lock';plc.className='nsub-chip'}
+  const rn=$('remoteNameHome');
+  if(st!=='gray'){rn.textContent=remote.node_id||status.runtime?.remote_device_name||'—';rn.style.color='var(--ink)';const chips=[];if((remote.channels||0)>0)chips.push(remote.channels+' ch');$('remoteChips').innerHTML=chips.map(ch=>`<span class="nsub-chip">${esc(ch)}</span>`).join('')}
+  else{rn.textContent='—';rn.style.color='var(--muted)';$('remoteChips').innerHTML=''}
+  const ow=stats.one_way_latency_ms||0;$('owVal').innerHTML=ow.toFixed(1)+'<span class="u"> ms</span>';$('owVal').className='sval '+rttCls(ow);
+  $('txBw').textContent=(stats.tx_mbps||0).toFixed(3);$('rxBw').textContent=(stats.rx_mbps||0).toFixed(3);
+  const loss=stats.loss_percent||0;$('lossVal').innerHTML=loss.toFixed(2)+'<span class="u"> %</span>';$('lossVal').className='sval '+lossCls(loss);
+  const jit=stats.jitter_ms||0;$('jitterVal').innerHTML=jit.toFixed(1)+'<span class="u"> ms</span>';$('jitterVal').className='sval '+(jit>20?'warn':'ok');
+  // Buffer bar
+  const fill=stats.fill_ms||0,target=stats.target_ms||status.runtime?.latency_ms||120,MAX=target*2;
+  const fp=Math.min(100,fill/MAX*100),tp=Math.min(100,target/MAX*100);
+  const bf=$('bufFill');bf.style.width=fp+'%';
+  bf.className='buffill'+(fill<20?' bad':fill<60?' warn':'');
+  $('bufTick').style.left=tp+'%';
+  // Position the legend target label at the same % as the tick
+  const lbl=$('bufTickLbl');if(lbl){lbl.textContent=target+' ms';lbl.style.left=tp+'%'}
+  $('fillMs').textContent=Number.isFinite(fill)?Math.round(fill):fill;$('targetMs').textContent=target;const blm=$('bufLegMax');if(blm)blm.textContent=MAX+' ms';
+  $('tMode').textContent=status.runtime?.remote_host?'direct IP':(status.runtime?.remote_device_name?'cloud':'passive');$('tHost').textContent=status.runtime?.remote_host||'—';
+  $('dRtt').textContent=(stats.rtt_ms||0).toFixed(1)+' ms';$('dOwLat').textContent=(stats.one_way_latency_ms||0).toFixed(1)+' ms';
+  const d=stats.drift_pressure_ppm||0;$('dDrift').textContent=(d>=0?'+':'')+d+' ppm';
+  $('dFps').textContent=(stats.decoded_fps||0).toFixed(1);$('dTxFps').textContent=(stats.tx_fps||0).toFixed(1);
+  $('dQ').textContent=stats.queued_groups||0;$('dOv').textContent=stats.ring_overflows||0;
+  $('dPlc').textContent=stats.plc_channels||0;$('dMiss').textContent=stats.seq_missing||0;
+  $('dSug').textContent=stats.recommended_buffer_ms?stats.recommended_buffer_ms+' ms':'—';
+  $('dUf').textContent=stats.output_underflows||0;$('dUp').textContent=(status.uptime_seconds||0)+' s';
+  renderMeters();updateSetupFromStatus();updateSignalLamps()}
+// ── Meters ───────────────────────────────────────────────────────────────────
 const DB_FLOOR=-60,DB_RANGE=60,DB_G=-18,DB_O=-10;
 function segH(db){if(!Number.isFinite(db)||db<=DB_FLOOR-.5)return{g:0,o:0,r:0};const s=Math.max(DB_FLOOR,Math.min(0,db));return{g:Math.max(0,(Math.min(s,DB_G)-DB_FLOOR)/DB_RANGE*100),o:Math.max(0,(Math.min(s,DB_O)-DB_G)/DB_RANGE*100),r:Math.max(0,(s-DB_O)/DB_RANGE*100)}}
 function dbTop(db){return(1-(db-DB_FLOOR)/DB_RANGE)*100}
 function makeMeter(lbl,key,ticks){const t=ticks?`<div class="barticks"><div class="tlbl hi" style="top:${dbTop(0)}%">0</div><div class="tlbl" style="top:${dbTop(DB_O)}%">-10</div><div class="tlbl" style="top:${dbTop(DB_G)}%">-18</div><div class="tlbl" style="top:${dbTop(DB_FLOOR)}%">-60</div></div>`:'';return`<div class="meter"><div class="bartrack" style="${ticks?'margin-left:32px':''}">${t}<div class="sg" id="sg_${key}" style="height:0"></div><div class="so" id="so_${key}" style="height:0;bottom:0"></div><div class="sr" id="sr_${key}" style="height:0;bottom:0"></div></div><div class="mdb" id="mdb_${key}">−∞</div><div class="mlbl">${lbl}</div></div>`}
 function updateMeter(key,db){const{g,o,r}=segH(db);const G=$('sg_'+key),O=$('so_'+key),R=$('sr_'+key),D=$('mdb_'+key);if(!G)return;G.style.height=g+'%';G.style.bottom='0';O.style.height=o+'%';O.style.bottom=g+'%';R.style.height=r+'%';R.style.bottom=(g+o)+'%';if(D)D.textContent=db>-100?db.toFixed(1):'−∞'}
-function renderMeters(){const txPeaks=stats.tx_peak_dbfs||[];const rxPeaks=stats.rx_peak_dbfs||[];const monPeaks=stats.monitor_peak_dbfs||[-120,-120];const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');const txN=Math.max(txPeaks.length,txDests.length,1);const rxN=Math.max(rxPeaks.length,rxSrcs.length);const txBank=$('txMeters'),rxBank=$('rxMeters'),monBank=$('monMeters');if(!txBank)return;const txKey='tx'+txN+(txDests.map(d=>d.label).join('|'));if(txBank.dataset.key!==txKey){txBank.innerHTML=txDests.map((d,i)=>{const lbl=d.label.replace(/^Send \d+ — /,'');return makeMeter('Ch '+(i+1)+(lbl?' — '+lbl:''),`tx${i}`,i===0)}).join('')||makeMeter('Ch 1','tx0',true);txBank.dataset.key=txKey}if(rxBank.dataset.key!==String(rxN)){rxBank.innerHTML=rxN>0?Array.from({length:rxN},(_,i)=>makeMeter('Ch '+(i+1),`rx${i}`,i===0)).join(''):'<div style="color:var(--muted);font-size:12px;padding:4px">No receive</div>';rxBank.dataset.key=String(rxN)}if(!monBank.children.length){monBank.innerHTML=makeMeter('L','mn0',true)+makeMeter('R','mn1',false)}txPeaks.forEach((v,i)=>updateMeter('tx'+i,v));rxPeaks.forEach((v,i)=>updateMeter('rx'+i,v));[monPeaks[0]??-120,monPeaks[1]??-120].forEach((v,i)=>updateMeter('mn'+i,v))}
-// Hover highlight
+function renderMeters(){
+  const txPeaks=stats.tx_peak_dbfs||[];const rxPeaks=stats.rx_peak_dbfs||[];const monPeaks=stats.monitor_peak_dbfs||[-120,-120];
+  const connected=(status.peer_status==='green'||status.peer_status==='orange');
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  const rxSrcs=connected?(matrix.sources||[]).filter(s=>s.kind==='network_receive'):[];
+  const txN=Math.max(txPeaks.length,txDests.length,1);const rxN=connected?Math.max(rxPeaks.length,rxSrcs.length):0;
+  const txBank=$('txMeters'),rxBank=$('rxMeters'),monBank=$('monMeters');if(!txBank)return;
+  const txKey='tx'+txN+(txDests.map(d=>d.label).join('|'));
+  if(txBank.dataset.key!==txKey){txBank.innerHTML=txDests.map((d,i)=>{const lbl=d.label.replace(/^Send \d+ — /,'');return makeMeter('Ch '+(i+1)+(lbl?' — '+lbl:''),`tx${i}`,i===0)}).join('')||makeMeter('Ch 1','tx0',true);txBank.dataset.key=txKey}
+  if(rxBank.dataset.key!==String(rxN)){rxBank.innerHTML=rxN>0?Array.from({length:rxN},(_,i)=>makeMeter('Ch '+(i+1),`rx${i}`,i===0)).join(''):'<div style="color:var(--muted);font-size:12px;padding:8px 0">No connected remote device</div>';rxBank.dataset.key=String(rxN)}
+  if(!monBank.children.length){monBank.innerHTML=makeMeter('L','mn0',true)+makeMeter('R','mn1',false)}
+  txPeaks.forEach((v,i)=>updateMeter('tx'+i,v));rxPeaks.forEach((v,i)=>updateMeter('rx'+i,v));[monPeaks[0]??-120,monPeaks[1]??-120].forEach((v,i)=>updateMeter('mn'+i,v))}
+// ── Hover highlight ──────────────────────────────────────────────────────────
 function setupHover(tableId){const tbl=$(tableId);if(!tbl)return;let pRow=null,pCols=[];function clear(){if(pRow)pRow.classList.remove('hl-row');pCols.forEach(c=>c.classList.remove('hl-col'));pRow=null;pCols=[]}tbl.addEventListener('mouseover',e=>{const cell=e.target.closest('td,th');if(!cell)return;clear();const tr=cell.parentElement;if(tr.parentElement.tagName==='TBODY'){tr.classList.add('hl-row');pRow=tr}const col=cell.cellIndex;const cols=Array.from(tbl.querySelectorAll(`tr>*:nth-child(${col+1})`));cols.forEach(c=>c.classList.add('hl-col'));pCols=cols});tbl.addEventListener('mouseleave',clear)}
-// Source user labels (client-side, synced from API dest labels on each render)
-const srcUserLabels={};
-function getSrcLabel(srcId){// Derive from the dest channel this source is routed to (if any)
-const route=(matrix.routes||[]).find(r=>r.source===srcId&&r.destination.startsWith('stream:0:ch:'));if(route){const dest=(matrix.destinations||[]).find(d=>d.id===route.destination);if(dest)return dest.label.replace(/^Send \d+ — /,'')}return srcUserLabels[srcId]||''}
-function getColLabel(destId){// Derive from the single source routed to this dest (if exactly one)
-const routes=(matrix.routes||[]).filter(r=>r.destination===destId&&!r.source.startsWith('ebu:'));if(routes.length!==1)return'';const lbl=getSrcLabel(routes[0].source);return lbl}
-async function saveSrcLabel(srcId,label){srcUserLabels[srcId]=label;const dest=(matrix.routes||[]).find(r=>r.source===srcId&&r.destination.startsWith('stream:0:ch:'));if(!dest)return;const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const labels=txDests.map(d=>{const r=(matrix.routes||[]).find(rx=>rx.destination===d.id&&!rx.source.startsWith('ebu:'));if(r&&r.source===srcId)return label;return d.label.replace(/^Send \d+ — /,'')});try{const res=await fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})});matrix=await res.json();matrixLastKey='';buildMatrices()}catch(e){console.error(e)}}
-// Route toggle (shared async)
-async function doRouteToggle(srcId,destId,routeSet,isRx){if(routeBusy)return;routeBusy=true;try{let routes=[...(matrix.routes||[])];const key=srcId+'>'+destId;const i=routes.findIndex(r=>r.source===srcId&&r.destination===destId);if(i>=0)routes.splice(i,1);else routes.push({source:srcId,destination:destId});const body={routes};if(destId.startsWith('output:'))body.monitor_mode='patch_matrix';const res=await fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});matrix=await res.json();matrixLastKey='';buildMatrices()}finally{routeBusy=false}}
-// Send routing
-function buildTxTable(){const txSrcsReg=(matrix.sources||[]).filter(s=>s.kind==='physical_input');const txSrcsUtil=(matrix.sources||[]).filter(s=>s.kind==='test_tone');const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const activeRoutes=new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination));const numCh=txDests.length;if(!numCh){$('txBody').innerHTML='<tr><td style="padding:16px;color:var(--muted);font-size:12px" colspan="1">No send channels configured</td></tr>';$('txHead').innerHTML='';return}let hRow=`<tr><th class="rh"></th>`;txDests.forEach((d,i)=>{const lbl=getColLabel(d.id);hRow+=`<th><div class="ch-hdr"><div class="ch-hdr-num">${i+1}</div><div class="ch-hdr-lbl" id="chlbl_${esc(d.id)}">${esc(lbl)}</div></div></th>`});hRow+='</tr>';$('txHead').innerHTML=hRow;let rows='';function srcRow(src,editable){const lbl=editable?getSrcLabel(src.id):'';const labelPart=editable?`<span class="src-sep">•</span><input class="src-label-input" data-src="${esc(src.id)}" value="${esc(lbl)}" maxlength="20" spellcheck="false" autocomplete="off" placeholder="label…">`:'';rows+=`<tr><td class="rh"><div class="src-row"><span class="rsig ${src.kind==='test_tone'?'live':''}"></span><span class="src-sysname">${esc(src.kind==='physical_input'?src.label.replace('Local Input','Local In'):src.label)}</span>${labelPart}</div></td>`;txDests.forEach(d=>{const on=activeRoutes.has(src.id+'>'+d.id);rows+=`<td class="xcell${on?' on':''}" data-src="${esc(src.id)}" data-dst="${esc(d.id)}"></td>`});rows+='</tr>'}txSrcsReg.forEach(s=>srcRow(s,true));if(txSrcsUtil.length){rows+=`<tr class="src-spacer"><td class="rh" style="height:10px"></td>${'<td style="height:10px;background:var(--bg)"></td>'.repeat(numCh)}</tr>`;txSrcsUtil.forEach(s=>srcRow(s,false))}$('txBody').innerHTML=rows;const inputs=Array.from(document.querySelectorAll('#txBody .src-label-input'));inputs.forEach((el,idx)=>{el.addEventListener('focus',()=>el.select());el.addEventListener('input',()=>{el.classList.add('dirty');srcUserLabels[el.dataset.src]=el.value;refreshTxColHeaders()});el.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();saveSrcLabel(el.dataset.src,el.value);const nx=inputs[idx+1];nx?nx.focus():el.blur()}if(e.key==='Escape'){el.value=getSrcLabel(el.dataset.src);el.classList.remove('dirty');el.blur()}});el.addEventListener('blur',()=>{if(el.classList.contains('dirty')){saveSrcLabel(el.dataset.src,el.value);el.classList.remove('dirty')}})});$('txBody').addEventListener('click',e=>{const cell=e.target.closest('.xcell');if(cell)doRouteToggle(cell.dataset.src,cell.dataset.dst)});setupHover('txTable')}
-function refreshTxColHeaders(){const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');txDests.forEach(d=>{const el=document.getElementById('chlbl_'+d.id);if(el)el.textContent=getColLabel(d.id)})}
-// 1:1 and clear for TX
-function doTx1to1(){const txSrcsReg=(matrix.sources||[]).filter(s=>s.kind==='physical_input');const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');let routes=[...(matrix.routes||[]).filter(r=>r.source.startsWith('ebu:'))];// Keep EBU routes
-const n=Math.min(txSrcsReg.length,txDests.length);for(let i=0;i<n;i++)routes.push({source:txSrcsReg[i].id,destination:txDests[i].id});fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
-function doTxClear(){const routes=(matrix.routes||[]).filter(r=>r.source.startsWith('ebu:'));// Keep EBU routes
-fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
-// Receive routing
-function buildRxTable(){const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');const activeRoutes=new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination));const numOut=rxDests.length;if(!rxSrcs.length||!numOut){$('rxHead').innerHTML=`<tr><th class="rh"></th></tr>`;$('rxBody').innerHTML='<tr><td style="padding:16px;color:var(--muted);font-size:12px" colspan="1">No connected remote device</td></tr>';return}let hRow=`<tr><th class="rh"></th>`;rxDests.forEach(d=>{const n=d.label.replace('Local Output ','Out ');hRow+=`<th><div class="ch-hdr"><div class="ch-hdr-num">${esc(n)}</div></div></th>`});hRow+='</tr>';$('rxHead').innerHTML=hRow;let rows='';rxSrcs.forEach(src=>{// Format: "DeviceName Ch N" — show as "DeviceName • Ch N"
-const parts=src.label.match(/^(.+?)\s+(Ch\s+\d+)$/i);const sysName=parts?parts[1]:src.label;const chName=parts?parts[2]:'';const labelPart=chName?`<span class="src-sep">•</span><span style="font-size:11px;font-weight:600;color:var(--ink)">${esc(chName)}</span>`:'';rows+=`<tr><td class="rh"><div class="src-row"><span class="rsig"></span><span class="src-sysname">${esc(sysName)}</span>${labelPart}</div></td>`;rxDests.forEach(d=>{const on=activeRoutes.has(src.id+'>'+d.id);rows+=`<td class="xcell${on?' on':''}" data-src="${esc(src.id)}" data-dst="${esc(d.id)}"></td>`});rows+='</tr>'});$('rxBody').innerHTML=rows;$('rxBody').addEventListener('click',e=>{const cell=e.target.closest('.xcell');if(cell)doRouteToggle(cell.dataset.src,cell.dataset.dst,null,true)});setupHover('rxTable')}
-function doRx1to1(){const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');const nonRx=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));const routes=[...nonRx];const n=Math.min(rxSrcs.length,rxDests.length);for(let i=0;i<n;i++)routes.push({source:rxSrcs[i].id,destination:rxDests[i].id,monitor_mode:'patch_matrix'});fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes,monitor_mode:'patch_matrix'})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
-function doRxClear(){const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
-// Matrix shape key — only rebuild tables when structure changes
-function matrixKey(){return JSON.stringify({s:(matrix.sources||[]).map(s=>s.id+s.kind),d:(matrix.destinations||[]).map(d=>d.id+d.label),r:(matrix.routes||[]).map(r=>r.source+r.destination).sort()})}
-function buildMatrices(){const k=matrixKey();if(k===matrixLastKey){refreshTxColHeaders();return}matrixLastKey=k;buildTxTable();buildRxTable()}
-// Audio devices
+// ── Label logic ──────────────────────────────────────────────────────────────
+// srcUserLabels is the canonical store. Labels are attached to the physical source,
+// not to the send channel. The send channel header reflects whichever source is routed there.
+// On startup, pre-populate srcUserLabels from server dest labels (strip "Send N — " prefix).
+function syncLabelsFromMatrix(){
+  (matrix.destinations||[]).filter(d=>d.kind==='network_send').forEach(d=>{
+    const serverLabel=d.label.replace(/^Send \d+ — /,'');
+    // Find which source is routed to this dest
+    const route=(matrix.routes||[]).find(r=>r.destination===d.id&&!r.source.startsWith('ebu:'));
+    if(route&&serverLabel&&serverLabel!==`Ch ${(matrix.destinations.indexOf(d)+1)}`){
+      // Server has a non-default label for this dest — attribute it to the source
+      if(!srcUserLabels[route.source])srcUserLabels[route.source]=serverLabel}
+  })}
+// Get the user label for a source id
+function getSrcLabel(srcId){const v=srcUserLabels[srcId];return v===undefined?'':v}
+// Get the column header label for a send dest: derived from routed sources
+function getColLabel(destId){
+  const routes=(matrix.routes||[]).filter(r=>r.destination===destId&&!r.source.startsWith('ebu:'));
+  if(!routes.length)return'';
+  if(routes.length===1)return getSrcLabel(routes[0].source);
+  // Multiple sources mixed — concatenate their labels
+  const labels=routes.map(r=>getSrcLabel(r.source)).filter(Boolean);
+  return labels.join(' + ')||''}
+// Save ALL source labels to the server (always, even without routes)
+// Labels array aligns with send channel destinations; empty string for channels with no label
+async function pushAllLabels(){
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  const labels=txDests.map(d=>{
+    const routes=(matrix.routes||[]).filter(r=>r.destination===d.id&&!r.source.startsWith('ebu:'));
+    if(!routes.length)return '';  // keep existing server label
+    if(routes.length===1)return getSrcLabel(routes[0].source)||d.label.replace(/^Send \d+ — /,'');
+    const mixed=routes.map(r=>getSrcLabel(r.source)).filter(Boolean);
+    return mixed.join(' + ')||d.label.replace(/^Send \d+ — /,'')});
+  try{const res=await fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})});const newMatrix=await res.json();matrix=newMatrix;matrixLastKey='';buildMatrices()}catch(e){console.error(e)}}
+async function saveSrcLabel(srcId,label){
+  srcUserLabels[srcId]=label.trim();
+  refreshTxColHeaders();
+  await pushAllLabels()}
+// ── Route toggle ─────────────────────────────────────────────────────────────
+async function doRouteToggle(srcId,destId){
+  if(routeBusy)return;routeBusy=true;
+  try{
+    let routes=[...(matrix.routes||[])];
+    const key=srcId+'>'+destId;
+    const exists=routes.findIndex(r=>r.source===srcId&&r.destination===destId);
+    if(exists>=0){
+      routes.splice(exists,1)  // remove existing crosspoint
+    }else{
+      // Adding a route: if src is physical_input, remove any tone routes to this dest first
+      const isInput=srcId.startsWith('input:');
+      if(isInput){routes=routes.filter(r=>!(r.destination===destId&&(r.source==='ebu:l'||r.source==='ebu:r')))}
+      // If src is a tone, remove any physical_input routes to this dest first
+      const isTone=srcId==='ebu:l'||srcId==='ebu:r';
+      if(isTone){routes=routes.filter(r=>!(r.destination===destId&&r.source.startsWith('input:')))}
+      routes.push({source:srcId,destination:destId})}
+    const body={routes};
+    if(destId.startsWith('output:'))body.monitor_mode='patch_matrix';
+    const res=await fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    matrix=await res.json();matrixLastKey='';buildMatrices();
+    // After route change, push labels so column headers reflect new routing
+    await pushAllLabels()
+  }finally{routeBusy=false}}
+// ── Send routing ─────────────────────────────────────────────────────────────
+function buildTxTable(){
+  const txSrcsReg=(matrix.sources||[]).filter(s=>s.kind==='physical_input');
+  const txSrcsUtil=(matrix.sources||[]).filter(s=>s.kind==='test_tone');
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  const activeRoutes=new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination));
+  const numCh=txDests.length;
+  if(!numCh){$('txBody').innerHTML='<tr><td style="padding:16px;color:var(--muted);font-size:12px" colspan="1">No send channels configured</td></tr>';$('txHead').innerHTML='';return}
+  // Column headers
+  let hRow=`<tr><th class="rh"></th>`;
+  txDests.forEach((d,i)=>{const lbl=getColLabel(d.id);hRow+=`<th><div class="ch-hdr"><div class="ch-hdr-num">${i+1}</div><div class="ch-hdr-lbl" id="chlbl_${esc(d.id)}">${esc(lbl)}</div></div></th>`});
+  hRow+='</tr>';$('txHead').innerHTML=hRow;
+  // Body rows
+  let rows='';
+  function srcRow(src,editable){
+    const lbl=editable?getSrcLabel(src.id):'';
+    const sysName=src.kind==='physical_input'?src.label.replace(/Local Input/,'Local In'):src.label;
+    // Use data-src-id on the rsig span so updateSignalLamps() can drive it
+    const labelPart=editable?`<span class="src-sep">•</span><input class="src-label-input" data-src="${esc(src.id)}" value="${esc(lbl)}" maxlength="20" spellcheck="false" autocomplete="off" placeholder="label…">`:'';
+    rows+=`<tr><td class="rh"><div class="src-row"><span class="rsig" data-src-id="${esc(src.id)}"></span><span class="src-sysname">${esc(sysName)}</span>${labelPart}</div></td>`;
+    txDests.forEach(d=>{const on=activeRoutes.has(src.id+'>'+d.id);rows+=`<td class="xcell${on?' on':''}" data-src="${esc(src.id)}" data-dst="${esc(d.id)}"></td>`});
+    rows+='</tr>'}
+  txSrcsReg.forEach(s=>srcRow(s,true));
+  if(txSrcsUtil.length){rows+=`<tr class="src-spacer"><td class="rh" style="height:10px"></td>${'<td style="height:10px;background:var(--bg);width:60px"></td>'.repeat(numCh)}</tr>`;txSrcsUtil.forEach(s=>srcRow(s,false))}
+  $('txBody').innerHTML=rows;
+  // Wire label inputs
+  const inputs=Array.from(document.querySelectorAll('#txBody .src-label-input'));
+  inputs.forEach((el,idx)=>{
+    el.addEventListener('focus',()=>el.select());
+    el.addEventListener('input',()=>{el.classList.add('dirty');srcUserLabels[el.dataset.src]=el.value;refreshTxColHeaders()});
+    el.addEventListener('keydown',e=>{
+      if(e.key==='Enter'){e.preventDefault();saveSrcLabel(el.dataset.src,el.value);el.classList.remove('dirty');const nx=inputs[idx+1];nx?nx.focus():el.blur()}
+      if(e.key==='Escape'){el.value=getSrcLabel(el.dataset.src);el.classList.remove('dirty');el.blur()}});
+    el.addEventListener('blur',()=>{if(el.classList.contains('dirty')){saveSrcLabel(el.dataset.src,el.value);el.classList.remove('dirty')}})});
+  $('txBody').addEventListener('click',e=>{const cell=e.target.closest('.xcell');if(cell&&!e.target.closest('input'))doRouteToggle(cell.dataset.src,cell.dataset.dst)});
+  setupHover('txTable');
+  updateSignalLamps()}
+function refreshTxColHeaders(){
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  txDests.forEach(d=>{const el=document.getElementById('chlbl_'+d.id);if(el)el.textContent=getColLabel(d.id)})}
+// 1:1 and clear: preserve non-input routes
+function doTx1to1(){
+  const txSrcsReg=(matrix.sources||[]).filter(s=>s.kind==='physical_input');
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  let routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('input:'));
+  const n=Math.min(txSrcsReg.length,txDests.length);
+  for(let i=0;i<n;i++)routes.push({source:txSrcsReg[i].id,destination:txDests[i].id});
+  fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(async m=>{matrix=m;matrixLastKey='';buildMatrices();await pushAllLabels()}).catch(console.error)}
+function doTxClear(){
+  const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('input:'));
+  fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(async m=>{matrix=m;matrixLastKey='';buildMatrices();await pushAllLabels()}).catch(console.error)}
+// ── Receive routing ──────────────────────────────────────────────────────────
+function doResetLabels(){Object.keys(srcUserLabels).forEach(k=>delete srcUserLabels[k]);const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const labels=txDests.map(()=>'');fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+function buildRxTable(){
+  const connected=(status.peer_status==='green'||status.peer_status==='orange');
+  const rxSrcs=connected?(matrix.sources||[]).filter(s=>s.kind==='network_receive'):[];
+  const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');
+  const activeRoutes=new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination));
+  const numOut=rxDests.length;
+  if(!rxSrcs.length||!numOut){
+    $('rxHead').innerHTML=`<tr><th class="rh"></th></tr>`;
+    $('rxBody').innerHTML='<tr><td style="padding:16px;color:var(--muted);font-size:12px" colspan="1">No connected remote device</td></tr>';return}
+  let hRow=`<tr><th class="rh"></th>`;
+  rxDests.forEach(d=>{const n=d.label.replace('Local Output ','Out ');hRow+=`<th><div class="ch-hdr"><div class="ch-hdr-num">${esc(n)}</div></div></th>`});
+  hRow+='</tr>';$('rxHead').innerHTML=hRow;
+  let rows='';
+  rxSrcs.forEach(src=>{
+    // Server sends label as "DeviceName • ChLabel" (• separator added in Rust)
+    const sep=src.label.indexOf(' \u2022 ');
+    const sysName=sep>=0?src.label.slice(0,sep):src.label;
+    const chName=sep>=0?src.label.slice(sep+3):'';
+    const labelPart=chName?`<span class="src-sep">\u2022</span><span style="font-size:11px;font-weight:600;color:var(--ink)">${esc(chName)}</span>`:'';
+    rows+=`<tr><td class="rh"><div class="src-row"><span class="rsig" data-src-id="${esc(src.id)}"></span><span class="src-sysname">${esc(sysName)}</span>${labelPart}</div></td>`;
+    rxDests.forEach(d=>{const on=activeRoutes.has(src.id+'>'+d.id);rows+=`<td class="xcell${on?' on':''}" data-src="${esc(src.id)}" data-dst="${esc(d.id)}"></td>`});
+    rows+='</tr>'});
+  $('rxBody').innerHTML=rows;
+  $('rxBody').addEventListener('click',e=>{const cell=e.target.closest('.xcell');if(cell)doRouteToggle(cell.dataset.src,cell.dataset.dst)});
+  setupHover('rxTable');
+  updateSignalLamps()}
+function doRx1to1(){
+  const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');
+  const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');
+  const nonRx=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));
+  const routes=[...nonRx];const n=Math.min(rxSrcs.length,rxDests.length);
+  for(let i=0;i<n;i++)routes.push({source:rxSrcs[i].id,destination:rxDests[i].id});
+  fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes,monitor_mode:'patch_matrix'})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+function doRxClear(){
+  const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));
+  fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+// ── Matrix key + build ───────────────────────────────────────────────────────
+function matrixKey(){return JSON.stringify({p:status.peer_status||'gray',s:(matrix.sources||[]).map(s=>s.id+s.kind+s.label),d:(matrix.destinations||[]).map(d=>d.id+d.label),r:(matrix.routes||[]).map(r=>r.source+r.destination).sort()})}
+function buildMatrices(){
+  syncLabelsFromMatrix();  // absorb any server-side label changes
+  const k=matrixKey();if(k===matrixLastKey){refreshTxColHeaders();updateSignalLamps();return}
+  matrixLastKey=k;buildTxTable();buildRxTable()}
+// ── Audio devices ────────────────────────────────────────────────────────────
 function renderDevices(){$('devices').innerHTML=`<div class="devrow"><span class="dk">Sample rate</span><b>${devices.sample_rate||48000} Hz</b></div><div class="devrow"><span class="dk">Default input</span><b>${esc(devices.default_input||'none')}</b></div><div class="devrow"><span class="dk">Input channels</span><b>${devices.default_input_channels??0}</b></div><div class="devrow"><span class="dk">Default output</span><b>${esc(devices.default_output||'none')}</b></div><div class="devrow"><span class="dk">Output channels</span><b>${devices.default_output_channels??0}</b></div>`}
-// Poll
-async function poll(){try{[status,stats,matrix]=await Promise.all([fetch('/api/status').then(r=>r.json()),fetch('/api/stats').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);render();buildMatrices()}catch(e){console.error(e)}}
-// Init
-fetch('/api/device-ip').then(r=>r.json()).then(d=>{$('deviceIpInput').value=d.ip||'unknown'}).catch(()=>{$('deviceIpInput').value='unknown'});
+// ── Offline overlay ──────────────────────────────────────────────────────────
+let pollFailCount=0;
+function showOffline(){document.body.innerHTML='<div style="position:fixed;inset:0;background:#080a0d;display:flex;align-items:center;justify-content:center;z-index:999"><div style="text-align:center;color:#7e8fa0;font:14px/2 system-ui,sans-serif"><div style="font-size:22px;font-weight:700;color:#e04040;margin-bottom:8px">Device offline</div></div></div>'}
+// ── Poll ─────────────────────────────────────────────────────────────────────
+async function poll(){
+  try{
+    [status,stats,matrix]=await Promise.all([fetch('/api/status').then(r=>r.json()),fetch('/api/stats').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);
+    pollFailCount=0;render();buildMatrices()
+  }catch(e){
+    pollFailCount++;if(pollFailCount>=3)showOffline()}}
+// ── Init ─────────────────────────────────────────────────────────────────────
+fetch('/api/device-ip').then(r=>r.json()).then(d=>{$('deviceIpInput').value=d.ip||'unknown'}).catch(()=>{const el=$('deviceIpInput');if(el)el.value='unknown'});
 fetch('/api/audio/devices').then(r=>r.json()).then(d=>{devices=d;renderDevices()}).catch(console.error);
 poll();setInterval(poll,200);
 </script>
