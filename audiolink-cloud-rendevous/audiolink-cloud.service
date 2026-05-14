@@ -1,0 +1,15 @@
+[Unit]
+Description=AudioLink Rendezvous Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/audiolink-cloud
+ExecStart=/opt/audiolink-cloud/audiolink-cloud
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
