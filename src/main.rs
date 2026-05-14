@@ -47,6 +47,11 @@ const MIN_LATENCY_MS: u32 = 5;
 const MAX_LATENCY_MS: u32 = 10_000;
 const MIN_EFFECTIVE_RX_BUFFER_MS: u32 = FRAME_MS * 2;
 const PHASE_LOCK_TIMEOUT_MS: u64 = 10;
+// If the sender engine restarts, its RTP timestamp/sequence counters start
+// again from the beginning. A high-watermark intended to drop genuinely late
+// packets must not reject the new stream until it catches up minutes later.
+const RTP_RESTART_ROLLBACK_SAMPLES: u32 = SAMPLE_RATE; // 1 second at 48kHz
+const RTP_RESTART_LOW_TS_SAMPLES: u32 = SAMPLE_RATE * 2; // first 2s of a fresh sender
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const CAP_RING_SIZE: usize = (SAMPLE_RATE as usize * 200) / 1000;
 const PB_RING_SIZE: usize = SAMPLE_RATE as usize;
@@ -67,6 +72,44 @@ const TX_SRC_SILENT: usize = usize::MAX;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Source {
     Matrix, // matrix-routed EBU/local-input sources
+}
+
+// ─── Encoder mode ─────────────────────────────────────────────────────────────
+
+/// Selects the Opus application type used for the send encoder.
+///
+/// Music  → Application::Audio (CELT engine, no FEC).
+///          Best for wideband programme material. Maximises quality per bit
+///          at the cost of no packet-loss recovery beyond Opus's own concealment.
+///
+/// Speech → Application::Voip (SILK + CELT hybrid, inband FEC enabled).
+///          Embeds a lower-bitrate redundant copy of each frame in the next
+///          packet. If that packet arrives, the decoder reconstructs the lost
+///          frame from the embedded data — effectively halving perceived loss
+///          rate on a flaky mobile path. The bitrate overhead is ~30–40%.
+///          The decoder requires no changes; FEC is transparent to the receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderMode {
+    #[default]
+    Music,
+    Speech,
+}
+
+impl EncoderMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Music  => "music",
+            Self::Speech => "speech",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "speech" | "voice" | "voip" => Self::Speech,
+            _ => Self::Music,
+        }
+    }
 }
 
 // ─── Packet format ────────────────────────────────────────────────────────────
@@ -452,12 +495,21 @@ fn split_host_port(value: &str) -> String {
 
 // ─── Encoder factory ──────────────────────────────────────────────────────────
 
-fn make_encoder_with_bitrate(bitrate_per_channel: u32) -> Result<opus::Encoder> {
-    let mut enc =
-        opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, opus::Application::Audio)?;
+fn make_encoder_for_mode(bitrate_per_channel: u32, mode: EncoderMode) -> Result<opus::Encoder> {
+    let app = match mode {
+        EncoderMode::Music  => opus::Application::Audio,
+        EncoderMode::Speech => opus::Application::Voip,
+    };
+    let mut enc = opus::Encoder::new(SAMPLE_RATE, opus::Channels::Mono, app)?;
     enc.set_bitrate(opus::Bitrate::Bits(bitrate_per_channel as i32))?;
-    enc.set_inband_fec(false)?;
+    // FEC is only meaningful in Voip/Speech mode. In Audio mode the encoder
+    // ignores the FEC flag but we set it explicitly for clarity.
+    enc.set_inband_fec(matches!(mode, EncoderMode::Speech))?;
     Ok(enc)
+}
+
+fn make_encoder_with_bitrate(bitrate_per_channel: u32) -> Result<opus::Encoder> {
+    make_encoder_for_mode(bitrate_per_channel, EncoderMode::default())
 }
 
 fn make_encoder() -> Result<opus::Encoder> {
@@ -547,6 +599,27 @@ pub struct JitterConfig {
     phase_lock: bool,
 }
 
+fn fresh_opus_decoders() -> Vec<opus::Decoder> {
+    (0..MAX_CHANNELS)
+        .map(|_| opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap())
+        .collect()
+}
+
+fn fresh_asrc_resamplers() -> Vec<FastFixedIn<f32>> {
+    (0..MAX_CHANNELS)
+        .map(|_| {
+            FastFixedIn::new(
+                1.0,
+                1.01,
+                PolynomialDegree::Linear,
+                FRAME_SAMPLES,
+                1,
+            )
+            .expect("Rubato resampler init failed")
+        })
+        .collect()
+}
+
 struct FrameGroup {
     packets: Vec<Option<Vec<u8>>>,
     expected: HashSet<u8>,
@@ -586,6 +659,20 @@ fn timestamp_elapsed_samples(newer: u32, older: u32) -> u32 {
     newer.wrapping_sub(older)
 }
 
+fn rtp_timestamp_at_or_before(ts: u32, reference: u32) -> bool {
+    // RFC3550-style serial-number comparison. True for equal timestamps and
+    // timestamps behind `reference`, false for timestamps ahead of it.
+    reference.wrapping_sub(ts) < 0x8000_0000
+}
+
+fn rtp_seq_looks_reset(prev: u16, next: u16) -> bool {
+    // Treat a backwards sequence jump as a probable sender restart, while not
+    // flagging the normal 65535 -> 0 wrap as backwards. This is only used in
+    // combination with a large RTP timestamp rollback, so small reordering does
+    // not reset the stream.
+    prev != next && prev.wrapping_sub(next) < 0x8000
+}
+
 fn latency_ms_to_samples(ms: u32) -> u32 {
     ((ms as u64 * SAMPLE_RATE as u64) / 1000) as u32
 }
@@ -608,6 +695,65 @@ fn sleep_until(deadline: Instant) {
         } else {
             std::thread::yield_now();
         }
+    }
+}
+
+fn udp_disconnect_socket(socket: &std::net::UdpSocket) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        unsafe {
+            let mut sa: libc::sockaddr_storage = std::mem::zeroed();
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                sa.ss_len = std::mem::size_of::<libc::sockaddr>() as u8;
+            }
+            sa.ss_family = libc::AF_UNSPEC as libc::sa_family_t;
+
+            // Linux accepts either sockaddr or sockaddr_storage length here; BSD/macOS
+            // is fussier, so try the small sockaddr length first, then the storage
+            // length. Calling AF_UNSPEC on an already-unconnected UDP socket is okay.
+            let ptr = &sa as *const libc::sockaddr_storage as *const libc::sockaddr;
+            let rc = libc::connect(
+                socket.as_raw_fd(),
+                ptr,
+                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+            );
+            if rc == 0 {
+                return Ok(());
+            }
+
+            let _first_err = std::io::Error::last_os_error();
+            let rc = libc::connect(
+                socket.as_raw_fd(),
+                ptr,
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+            );
+            if rc == 0 {
+                Ok(())
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::NotConnected {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        Ok(())
     }
 }
 
@@ -642,17 +788,21 @@ fn drain_phase_locked_groups(
     decoded: &mut [Vec<f32>],
     pcm: &mut [f32],
     on_group: &mut dyn FnMut(&[Vec<f32>], usize),
-) -> (usize, usize) {
+) -> (usize, usize, Option<u32>) {
     let active = remote_channels.min(MAX_CHANNELS);
     if active == 0 {
-        return (0, 0);
+        return (0, 0, None);
     }
 
     // Drain strictly oldest-first. A complete oldest group is ready immediately.
     // An incomplete oldest group becomes ready after the 10ms phase-lock timeout
     // and missing/corrupt channels are generated with Opus PLC.
+    // Returns the last drained RTP timestamp so the caller can discard any
+    // late-arriving packets for already-processed timestamps — preventing
+    // double-decode which inflates decoded_fps above 50 and drives fill growth.
     let mut output_groups = 0usize;
     let mut plc_channels = 0usize;
+    let mut last_drained_ts: Option<u32> = None;
 
     loop {
         let ready_ts = match groups.iter().next() {
@@ -674,9 +824,10 @@ fn drain_phase_locked_groups(
         }
         on_group(decoded, active);
         output_groups += 1;
+        last_drained_ts = Some(ready_ts);
     }
 
-    (output_groups, plc_channels)
+    (output_groups, plc_channels, last_drained_ts)
 }
 
 
@@ -750,6 +901,7 @@ struct PersistedRuntimeConfig {
     latency_ms: Option<u32>,
     fixed_jitter: Option<bool>,
     phase_lock: Option<bool>,
+    encoder_mode: Option<EncoderMode>,
     channel_labels: Option<Vec<String>>,
     rendezvous_url: Option<String>,
 }
@@ -869,6 +1021,12 @@ struct UiStats {
     seq_missing: usize,
     loss_percent: f64,
     jitter_ms: f64,
+    /// P95 inter-packet arrival jitter over a rolling 60s window (~300 packets at 50fps).
+    /// More honest than the EMA for buffer-sizing decisions — EMA smooths spikes out.
+    jitter_p95_ms: f64,
+    /// Suggested receive buffer: jitter_p95 × 4, clamped to 500ms.
+    /// Displayed as a non-blocking UI hint when it meaningfully exceeds the current target.
+    recommended_buffer_ms: u32,
     latency_ms: usize,
     rx_mbps: f64,
     tx_mbps: f64,
@@ -904,6 +1062,8 @@ struct RuntimeSummary {
     effective_latency_ms: u32,
     fixed_jitter: bool,
     phase_lock: bool,
+    /// "music" or "speech" — the Opus Application mode in use for the send encoder.
+    encoder_mode: String,
     link_password_configured: bool,
     rendezvous_url: String,
     web_note: String,
@@ -1106,6 +1266,12 @@ struct SetupApplyRequest {
     opus_bitrate_per_channel: u32,
     receive_buffer_ms: u32,
     rendezvous_url: Option<String>,
+    /// Whether to hold all channels for a given RTP timestamp until the complete
+    /// set arrives before decoding. Defaults to current runtime value if absent.
+    phase_lock: Option<bool>,
+    /// Opus encoder application mode: "music" (Application::Audio, no FEC) or
+    /// "speech" (Application::Voip, inband FEC enabled). Defaults to current value.
+    encoder_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1315,69 +1481,383 @@ async fn index_handler(State(_state): State<WebState>) -> Html<String> {
 <html lang="en-GB">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AudioLink Control</title>
 <style>
-:root{--bg:#101418;--panel:#171d23;--ink:#e8eef4;--muted:#8fa0ad;--line:#2b3741;--green:#20c363;--orange:#f2a23a;--red:#e84b4b;--blue:#5ca8ff;--cell:#202a33}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}header{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--line);background:#0d1115;position:sticky;top:0;z-index:6}h1{font-size:18px;margin:0;letter-spacing:.05em;text-transform:uppercase}.node{color:var(--muted);font-size:13px}nav{display:flex;gap:8px;padding:12px 20px;background:#12181e;border-bottom:1px solid var(--line);position:sticky;top:61px;z-index:5}button,select,input{background:#0f151b;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px}button{cursor:pointer}button.tab.active{background:var(--blue);color:#07111b;border-color:var(--blue)}main{padding:20px;max-width:1500px;margin:auto}.page{display:none}.page.active{display:block}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.16)}.card h2,.card h3{margin:0 0 12px}.kv{display:grid;grid-template-columns:1fr auto;gap:7px 12px}.kv span:nth-child(odd){color:var(--muted)}.status{display:inline-flex;align-items:center;gap:8px}.lamp{width:12px;height:12px;border-radius:50%;background:#66717b;box-shadow:0 0 0 2px rgba(255,255,255,.04)}.lamp.green{background:var(--green);box-shadow:0 0 12px var(--green)}.lamp.orange{background:var(--orange);box-shadow:0 0 12px var(--orange)}.lamp.red{background:var(--red);box-shadow:0 0 12px var(--red)}.remotealert{display:none;margin:0 0 16px;padding:13px 15px;border:1px solid var(--red);border-radius:12px;background:rgba(232,75,75,.18);color:#ffd0d0;font-weight:800}.remotealert.show{display:block}.remotealert.orange{border-color:var(--orange);background:rgba(242,162,58,.15);color:#ffe4bd}.topalert{display:none;position:sticky;top:111px;z-index:4;margin:-20px -20px 18px;padding:12px 20px;background:var(--red);color:#fff;font-weight:800}.topalert.show{display:block}.topalert.orange{background:#b26b12}.local-lost{display:none;position:fixed;inset:0;z-index:99;background:rgba(5,7,10,.94);align-items:center;justify-content:center;text-align:center;padding:24px}.local-lost.show{display:flex}.lost-box{max-width:560px;border:1px solid var(--red);border-radius:18px;background:#160d0f;padding:32px;box-shadow:0 20px 80px rgba(0,0,0,.55)}.lost-box h2{font-size:32px;margin:0 0 8px}.lost-box p{color:#f4c9c9;margin:0;font-size:16px}.matrix-wrap{overflow:auto;border:1px solid var(--line);border-radius:14px;background:#0e1318}.matrix{border-collapse:separate;border-spacing:0;min-width:700px;width:100%}.matrix th,.matrix td{border-right:1px solid var(--line);border-bottom:1px solid var(--line);padding:6px 8px;text-align:center;white-space:nowrap}.matrix th{position:sticky;top:0;background:#151c23;z-index:2}.matrix th:first-child{left:0;z-index:3}.matrix .rowhead{position:sticky;left:0;background:#151c23;text-align:left;z-index:1;min-width:230px}.xcell{cursor:pointer;min-width:48px;height:34px;background:rgba(32,42,51,.75);user-select:none;padding:0}.xcell.on{background:var(--green);box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)}.xcell:active{filter:brightness(1.12)}.send-head{display:grid;gap:5px;min-width:110px}.send-head input{width:100%;padding:5px 6px;border-radius:6px;text-align:center;font-size:12px}.sig{display:inline-block;width:8px;height:8px;border-radius:50%;background:#5c6670;margin-right:8px}.sig.green{background:var(--green)}.sig.orange{background:var(--orange)}.sig.red{background:var(--red)}.meterbank{display:grid;grid-template-columns:repeat(auto-fill,minmax(54px,64px));gap:18px;align-items:end;margin:6px 0 24px}.meter{height:340px;display:grid;grid-template-rows:260px auto auto;justify-items:center;align-items:end}.barbox{position:relative;width:22px;height:260px;background:#06090c;border-left:1px solid #111820;border-right:1px solid #111820;overflow:hidden}.seg{position:absolute;left:0;right:0;height:0;bottom:0;transition:height .02s linear}.seg.green{background:var(--green)}.seg.orange{background:var(--orange)}.seg.red{background:var(--red)}.ticks{position:absolute;inset:0;pointer-events:none}.tick{position:absolute;left:-22px;width:18px;border-top:1px solid rgba(190,198,204,.55);font-size:11px;color:#a5adb4;text-align:right;line-height:1;transform:translateY(-1px);font-variant-numeric:tabular-nums}.tick.major{border-top-color:rgba(230,235,238,.75);color:#cbd2d8}.tick.ref18{border-top-color:rgba(32,195,99,.95);color:#bff4d0}.tick.ref10{border-top-color:rgba(242,162,58,.95);color:#ffd38d}.meterlabel{text-align:center;color:#cfd6dc;font-size:12px;line-height:1.12;min-height:28px;max-width:70px;overflow:hidden}.db{text-align:center;font-variant-numeric:tabular-nums;font-size:11px;color:#aeb7bf;min-height:16px;margin-top:6px}.formgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}.field{display:grid;gap:6px;margin-bottom:10px}.note{color:var(--muted)}.empty-note{color:var(--muted);padding:16px 0 22px;font-size:14px}.warn{color:var(--orange)}a{color:var(--blue)}
+:root{--bg:#0d1117;--panel:#161c24;--panel2:#1c2430;--ink:#e2eaf2;--muted:#7e8fa0;--line:#252f3a;--cell:#1a2430;--green:#1dba5b;--orange:#f0a030;--red:#e04040;--blue:#4d9fff;--blue2:#1e5fa0;--hbg:#090d12;--hborder:#1e2830;--nbg:#0f141a;--logo:#e8eef4;--htext:#7e8fa0;--mono:'JetBrains Mono','Fira Code','Cascadia Code',monospace}
+body.light{--bg:#f0f3f7;--panel:#fff;--panel2:#e6eaf0;--ink:#111820;--muted:#6b7a8d;--line:#ccd3de;--cell:#dde3ec;--blue2:#1858a8;--hbg:#fff;--hborder:#ccd3de;--nbg:#f5f7fa;--logo:#111820;--htext:#5a6a7a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font:13.5px/1.5 'IBM Plex Sans','Segoe UI',system-ui,sans-serif;transition:background .2s,color .2s}
+input,select,button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 10px;transition:background .2s,color .2s,border-color .2s}
+input:focus,select:focus{outline:2px solid var(--blue);outline-offset:1px;border-color:transparent}
+button{cursor:pointer}
+header{display:flex;align-items:center;justify-content:space-between;padding:11px 20px;border-bottom:1px solid var(--hborder);background:var(--hbg);position:sticky;top:0;z-index:20;gap:10px;transition:background .2s,border-color .2s}
+.logo{font-size:15px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--logo);flex-shrink:0;transition:color .2s}
+.logo span{color:var(--blue)}
+.nodeline{color:var(--htext);font-size:11px;margin-top:2px;font-family:var(--mono);transition:color .2s}
+.hright{display:flex;align-items:center;gap:9px;flex-shrink:0}
+.theme-btn{background:transparent;border:1px solid var(--hborder);border-radius:16px;padding:4px 10px;font-size:11px;color:var(--htext);transition:border-color .2s,color .2s}
+.theme-btn:hover{border-color:var(--muted);color:var(--ink)}
+.conn-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:18px;font-size:12px;font-weight:600;border:1px solid;white-space:nowrap}
+.conn-badge.green{background:rgba(29,186,91,.1);border-color:rgba(29,186,91,.4);color:#3ed47a}
+.conn-badge.orange{background:rgba(240,160,48,.1);border-color:rgba(240,160,48,.4);color:#e8920a}
+.conn-badge.gray{background:rgba(100,120,140,.07);border-color:rgba(100,120,140,.22);color:var(--muted)}
+.lamp{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.lamp.green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.lamp.orange{background:var(--orange);box-shadow:0 0 6px var(--orange)}
+.lamp.gray{background:#3a4a5a}
+body.light .lamp.gray{background:#a0b0c0}
+nav{display:flex;gap:5px;padding:8px 20px;background:var(--nbg);border-bottom:1px solid var(--line);position:sticky;top:51px;z-index:19;overflow-x:auto;transition:background .2s,border-color .2s}
+.tab{padding:5px 13px;border-radius:7px;font-size:13px;font-weight:500;border:1px solid transparent;background:transparent;color:var(--muted);white-space:nowrap;transition:.12s}
+.tab:hover{color:var(--ink);background:var(--panel)}
+.tab.active{background:var(--blue2);color:#c8e0ff;border-color:rgba(77,159,255,.28)}
+body.light .tab.active{color:#fff}
+.alertbar{display:none;padding:8px 20px;font-size:12px;font-weight:700;letter-spacing:.04em;text-align:center}
+.alertbar.show{display:block}
+.alertbar.offline{background:#6e1010;color:#ffc8c8}
+.alertbar.degraded{background:#6a3c08;color:#ffd8a0}
+main{padding:16px 20px;max-width:1400px;margin:auto}
+.page{display:none}.page.active{display:block}
+.mb{margin-bottom:13px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:15px;transition:background .2s,border-color .2s}
+.ctitle{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+@media(max-width:700px){.g2{grid-template-columns:1fr}}
+.link-ov{display:grid;grid-template-columns:1fr 1px 1fr;gap:16px;align-items:start}
+.node-col{display:flex;flex-direction:column;gap:5px}
+.nname{font-size:19px;font-weight:700;font-family:var(--mono)}
+.nsub-chip{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:2px 7px;font-size:11px;color:var(--muted);white-space:nowrap}
+.nsub-chip.live{color:var(--green);border-color:rgba(29,186,91,.3)}
+.divv{background:var(--line);min-height:60px;align-self:stretch}
+.statgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:13px}
+@media(max-width:780px){.statgrid{grid-template-columns:repeat(3,1fr)}}
+.stile{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 13px;transition:background .2s}
+.slbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px}
+.sval{font-size:20px;font-weight:700;font-family:var(--mono);line-height:1}
+.sval.ok{color:var(--green)}.sval.warn{color:var(--orange)}.sval.bad{color:var(--red)}.sval.dim{color:var(--ink)}
+.sval .u{font-size:12px;font-weight:400;color:var(--muted)}
+.bufrow{display:flex;align-items:baseline;gap:8px;margin-bottom:9px}
+.bufms{font-size:22px;font-weight:700;font-family:var(--mono)}
+.bufmeta{font-size:12px;color:var(--muted)}
+.buftrack{height:10px;background:var(--bg);border-radius:5px;position:relative;border:1px solid var(--line);overflow:visible;transition:background .2s}
+.buffill{height:100%;border-radius:5px;background:var(--green);transition:width .22s ease}
+.buffill.warn{background:var(--orange)}.buffill.bad{background:var(--red)}
+.buftick{position:absolute;top:-4px;bottom:-4px;width:2px;background:rgba(128,160,180,.5);border-radius:2px}
+.bufleg{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-top:4px}
+details{margin-top:9px}
+details summary{cursor:pointer;list-style:none;font-size:12px;color:var(--blue);padding:4px 0;display:flex;align-items:center;gap:5px;user-select:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:'›';font-size:15px;transition:.12s;display:inline-block;width:12px}
+details[open] summary::before{transform:rotate(90deg)}
+.dkv{display:grid;grid-template-columns:1fr 1fr;gap:5px 13px;padding:10px;background:var(--bg);border-radius:8px;margin-top:5px;border:1px solid var(--line);font-size:12px;transition:background .2s}
+.dkv .k{color:var(--muted)}.dkv .v{font-family:var(--mono);font-size:11px}
+.mbank{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;padding:4px 0}
+.meter{display:flex;flex-direction:column;align-items:center;gap:5px;flex-shrink:0}
+.bartrack{width:22px;height:220px;position:relative;border-radius:3px;border:1px solid var(--line);overflow:hidden;background:var(--bg);transition:background .2s,border-color .2s}
+.bartrack::after{content:'';position:absolute;inset:0;pointer-events:none;z-index:3;background:linear-gradient(to top,transparent calc(70% - .5px),rgba(255,255,255,.2) calc(70% - .5px),rgba(255,255,255,.2) calc(70% + .5px),transparent calc(70% + .5px)),linear-gradient(to top,transparent calc(83.3% - .5px),rgba(255,255,255,.15) calc(83.3% - .5px),rgba(255,255,255,.15) calc(83.3% + .5px),transparent calc(83.3% + .5px))}
+.sg,.so,.sr{position:absolute;left:0;right:0;transition:height .05s linear,bottom .05s linear}
+.sg{background:var(--green);bottom:0;z-index:1}.so{background:var(--orange);z-index:2}.sr{background:var(--red);z-index:2}
+.barticks{position:absolute;right:calc(100% + 5px);top:0;bottom:0;width:26px;pointer-events:none}
+.tlbl{position:absolute;font-size:9px;color:var(--muted);right:0;transform:translateY(-50%);font-family:var(--mono);line-height:1;white-space:nowrap}
+.tlbl.hi{color:var(--ink)}
+.mdb{font-family:var(--mono);font-size:10px;color:var(--muted);width:40px;text-align:center}
+.mlbl{font-size:10px;color:var(--muted);text-align:center;width:44px;line-height:1.3}
+.page.routing{margin:-16px -20px 0}
+.route-toolbar{display:flex;align-items:center;gap:10px;padding:9px 20px;background:var(--nbg);border-bottom:1px solid var(--line);transition:background .2s}
+.route-btn{padding:5px 14px;font-size:12px;font-weight:600;background:var(--panel);border:1px solid var(--line);border-radius:7px;color:var(--muted);transition:color .15s,border-color .15s,background .15s}
+.route-btn:hover{color:var(--ink);border-color:var(--muted)}
+.route-btn.arm{background:rgba(224,64,64,.1);border-color:rgba(224,64,64,.5);color:var(--red);animation:armPulse .25s ease}
+@keyframes armPulse{from{transform:scale(1.04)}to{transform:scale(1)}}
+.matrix-outer{overflow:auto;max-height:calc(100vh - 148px);border-bottom:1px solid var(--line)}
+table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
+.mx th,.mx td{border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+.mx td.rh,.mx th.rh{position:sticky;left:0;z-index:2;background:var(--panel2);width:230px;min-width:230px;padding:0;transition:background .2s}
+.mx thead th.rh{z-index:5;top:0}
+.mx thead th:not(.rh){position:sticky;top:0;z-index:3;background:var(--panel2);width:36px;min-width:36px;max-width:36px;padding:0;vertical-align:bottom;transition:background .2s}
+.ch-hdr{display:flex;flex-direction:column;align-items:center;padding:5px 1px 4px;gap:2px;min-height:48px;justify-content:flex-end}
+.ch-hdr-num{font-size:9px;font-weight:700;color:var(--muted);letter-spacing:.04em}
+.ch-hdr-lbl{font-size:9px;color:var(--ink);font-weight:600;width:34px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;min-height:12px}
+.src-row{display:flex;align-items:center;gap:5px;padding:0 8px;height:36px;white-space:nowrap;overflow:hidden}
+.rsig{display:inline-block;width:6px;height:6px;border-radius:50%;background:#2e3e4e;flex-shrink:0}
+.rsig.live{background:var(--green)}
+.src-sysname{font-size:12px;font-weight:600;flex-shrink:0;overflow:hidden;text-overflow:ellipsis}
+.src-sep{color:var(--muted);font-size:11px;flex-shrink:0}
+.src-label-input{flex:1;min-width:40px;max-width:120px;padding:1px 5px;font-size:11px;font-weight:600;background:transparent;border:1px solid transparent;border-radius:5px;color:var(--ink);transition:border-color .12s,background .12s}
+.src-label-input:focus{background:var(--panel);border-color:var(--blue);outline:none}
+.src-label-input.dirty{border-color:var(--orange)}
+.src-label-input::placeholder{color:var(--line)}
+.mx tr.src-spacer td{height:10px;background:var(--bg);border-right:none;pointer-events:none}
+.mx tr.src-spacer td.rh{background:var(--bg)}
+.xcell{width:36px;min-width:36px;max-width:36px;height:36px;background:var(--cell);cursor:pointer;padding:0;transition:filter .06s}
+.xcell.on{background:var(--green)}
+.mx tr.hl-row > .rh{background:rgba(77,159,255,.12)!important}
+.mx tr.hl-row > .xcell:not(.on){background:rgba(77,159,255,.10)!important}
+.mx td.hl-col.xcell:not(.on){background:rgba(77,159,255,.08)!important}
+.mx th.hl-col{background:rgba(77,159,255,.08)!important}
+.mx tr.hl-row > td.hl-col.xcell:not(.on){background:rgba(77,159,255,.20)!important}
+.mx .xcell.on.hl-col,.mx tr.hl-row > .xcell.on{filter:brightness(1.3)}
+.sgrid{display:grid;grid-template-columns:1fr 1fr;gap:13px;align-items:start}
+@media(max-width:860px){.sgrid{grid-template-columns:1fr}}
+.field{display:grid;gap:5px;margin-bottom:10px}
+.field label{font-size:12px;font-weight:600}
+.hint{font-weight:400;color:var(--muted)}
+.field input,.field select{width:100%}
+.idrow{display:flex;gap:6px}
+.idrow input{flex:1;font-family:var(--mono);font-size:13px;font-weight:600}
+.cpybtn{padding:7px 10px;font-size:12px;background:var(--panel2);border-color:var(--line);white-space:nowrap;flex-shrink:0}
+.savebtn{padding:7px 10px;font-size:12px;background:var(--blue2);border-color:rgba(77,159,255,.38);color:#c8e0ff;white-space:nowrap;flex-shrink:0;display:none}
+.savebtn.show{display:inline-block}
+.mpill{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:18px;font-size:12px;font-weight:700;border:1px solid;transition:.2s;margin-top:11px}
+.mpill.rdv{background:rgba(77,159,255,.09);border-color:rgba(77,159,255,.32);color:#5ab0f0}
+.mpill.dir{background:rgba(29,186,91,.09);border-color:rgba(29,186,91,.32);color:#3dcc72}
+.mpill.pas{background:rgba(100,120,140,.06);border-color:rgba(100,120,140,.22);color:var(--muted)}
+.mdot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:currentColor}
+.crow{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)}
+.crow:last-child{border-bottom:none}
+.ck{font-size:12px;color:var(--muted)}
+.cv select{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px}
+.cv input[type=checkbox]{width:auto;margin:0;accent-color:var(--green)}
+.applybtn{width:100%;padding:8px 11px;margin-top:10px;background:var(--blue2);border-color:rgba(77,159,255,.38);color:#c8e0ff;font-size:12px;font-weight:600;border-radius:8px;transition:background .15s,border-color .15s,color .15s}
+.applybtn:hover{background:#2870c4}
+.applybtn.arm{background:rgba(224,64,64,.14);border-color:rgba(224,64,64,.5);color:var(--red)}
+.applybtn.done{background:rgba(29,186,91,.14);border-color:rgba(29,186,91,.4);color:var(--green);cursor:default}
+.devrow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+.devrow:last-child{border-bottom:none}
+.dk{color:var(--muted)}
+.card-divider{border:none;border-top:1px solid var(--line);margin:12px 0}
 </style>
 </head>
 <body>
-<div id="localLost" class="local-lost"><div class="lost-box"><h2>Not connected</h2><p>The browser has lost its control connection to this AudioLink device. Check that audiolinkd is still running, then refresh when it is back online.</p></div></div>
-<header><div><h1>AudioLink Control</h1><div class="node" id="nodeLine">Starting…</div></div><div class="status"><span id="peerLamp" class="lamp"></span><span id="peerText">No connected device</span></div></header>
-<nav><button class="tab active" data-page="home">Home</button><button class="tab" data-page="txrouting">Send Routing</button><button class="tab" data-page="rxrouting">Receive Routing</button><button class="tab" data-page="meters">Peak Meters</button><button class="tab" data-page="setup">Setup</button></nav>
+<div id="alertbar" class="alertbar offline show">REMOTE DEVICE OFFLINE</div>
+<header>
+  <div><div class="logo">Audio<span>Link</span></div><div class="nodeline" id="nodeLine">Starting…</div></div>
+  <div class="hright">
+    <button class="theme-btn" id="themeBtn" onclick="toggleTheme()"></button>
+    <div id="connBadge" class="conn-badge gray"><span class="lamp gray" id="peerLamp"></span><span id="peerText">No connected device</span></div>
+  </div>
+</header>
+<nav>
+  <button class="tab active" data-page="home">Home</button>
+  <button class="tab" data-page="txrouting">Send Routing</button>
+  <button class="tab" data-page="rxrouting">Receive Routing</button>
+  <button class="tab" data-page="meters">Meters</button>
+  <button class="tab" data-page="setup">Setup</button>
+</nav>
 <main>
-<div id="topAlert" class="topalert">REMOTE DEVICE OFFLINE</div>
-<div id="remoteBanner" class="remotealert">Remote connected device offline.</div>
-<section id="home" class="page active"><div class="grid"><div class="card"><h2>Local Link</h2><div class="kv" id="localKv"></div></div><div class="card"><h2>Connected Device</h2><div class="kv" id="peerKv"></div></div><div class="card"><h2>Connection Stats</h2><div class="kv" id="statsKv"></div></div><div class="card"><h2>Audio Engine</h2><div class="kv" id="audioKv"></div></div></div></section>
-<section id="txrouting" class="page"><div class="card"><h2>Send Routing</h2><div id="txMatrix"></div></div></section>
-<section id="rxrouting" class="page"><div class="card"><h2>Receive Routing</h2><div id="rxMatrix"></div></div></section>
-<section id="meters" class="page"><div class="card"><h2>Peak Meters</h2><h3>Send</h3><div class="meterbank" id="txMeters"></div><h3>Receive</h3><div class="meterbank" id="rxMeters"></div><h3>Local Output</h3><div class="meterbank" id="monMeters"></div></div></section>
-<section id="setup" class="page"><div class="formgrid"><div class="card"><h2>Link Setup</h2><div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" placeholder="debian-vm-2"></div><div class="field"><label>Remote host IP (leave blank to wait for incoming)</label><input id="cfgPeer" autocomplete="off" placeholder="192.168.64.3 — blank = responder mode"></div><div class="field"><label>This device name</label><input id="cfgNode" autocomplete="off"></div><div class="field"><label>Link password (optional)</label><div style="display:flex;gap:6px"><input id="cfgLinkPw" autocomplete="off" type="password" placeholder="Leave blank if not required" style="flex:1"><button type="button" onclick="togglePwVis()" id="cfgLinkPwBtn" title="Show/hide password" style="padding:0 10px;font-size:1.1em">👁</button></div></div><div class="field"><label>Link token override (advanced — leave blank)</label><input id="cfgToken" autocomplete="off" spellcheck="false" placeholder="Derived automatically from device name"></div><div class="field"><label>Rendezvous server (optional — for internet connections)</label><input id="cfgRendezvous" autocomplete="off" placeholder="https://audiolink.amsound.co.uk"></div><div class="field"><label>Network send channels</label><select id="cfgChannels"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></div><div id="setupLink" class="kv"></div></div><div class="card"><h2>Codec</h2><div class="field"><label>Codec</label><select disabled><option>Opus</option></select></div><div class="field"><label>Bitrate per channel</label><select id="bitrate"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></div><div class="field"><label>Frame size</label><select disabled><option>20 ms</option></select></div><div class="field"><label>Incoming audio buffer</label><select id="rxBuffer"><option value="5">5 ms</option><option value="10">10 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="140">140 ms</option><option value="160">160 ms</option><option value="180">180 ms</option><option value="200">200 ms</option><option value="250">250 ms</option><option value="300">300 ms</option><option value="400">400 ms</option><option value="500">500 ms</option><option value="750">750 ms</option><option value="1000">1 s</option><option value="1500">1.5 s</option><option value="2000">2 s</option><option value="3000">3 s</option><option value="5000">5 s</option><option value="10000">10 s</option></select></div><div class="field"><button onclick="applySetup()">Apply and rebuild engine</button></div><pre id="restartCommand" class="cmd"></pre></div><div class="card"><h2>Audio Devices</h2><div id="devices"></div></div></div></section>
+<section id="home" class="page active">
+  <div class="card mb">
+    <div class="ctitle">Link</div>
+    <div class="link-ov">
+      <div class="node-col">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">This device</div>
+        <div class="nname" id="localName">—</div>
+        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px">
+          <span class="nsub-chip" id="localCh">—</span>
+          <span class="nsub-chip" id="localBr">—</span>
+          <span class="nsub-chip" id="localCodec">music</span>
+          <span class="nsub-chip" id="localPl">phase lock</span>
+        </div>
+      </div>
+      <div class="divv"></div>
+      <div class="node-col">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">Remote device</div>
+        <div class="nname" id="remoteNameHome" style="color:var(--muted)">—</div>
+        <div id="remoteChips" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px"></div>
+      </div>
+    </div>
+  </div>
+  <div class="statgrid">
+    <div class="stile"><div class="slbl">One-way latency</div><div class="sval ok" id="owVal">—<span class="u"> ms</span></div></div>
+    <div class="stile"><div class="slbl">TX</div><div class="sval dim"><span id="txBw">—</span><span class="u"> Mb/s</span></div></div>
+    <div class="stile"><div class="slbl">RX</div><div class="sval dim"><span id="rxBw">—</span><span class="u"> Mb/s</span></div></div>
+    <div class="stile"><div class="slbl">Packet loss</div><div class="sval ok" id="lossVal">—<span class="u"> %</span></div></div>
+    <div class="stile"><div class="slbl">Jitter EMA</div><div class="sval ok" id="jitterVal">—<span class="u"> ms</span></div></div>
+  </div>
+  <div class="card mb">
+    <div class="ctitle">Incoming Buffer</div>
+    <div class="bufrow"><span class="bufms" id="fillMs">—</span><span class="bufmeta">ms · target <b id="targetMs" style="color:var(--ink)">—</b> ms</span></div>
+    <div class="buftrack"><div class="buffill" id="bufFill" style="width:0"></div><div class="buftick" id="bufTick" style="left:100%"></div></div>
+    <div class="bufleg"><span>0</span><span id="bufTickLbl">—</span><span>200 ms</span></div>
+  </div>
+  <div class="card">
+    <div class="ctitle">Transport</div>
+    <div style="font-size:13px;color:var(--muted)">
+      <div>Mode: <b id="tMode" style="color:var(--ink)">—</b></div>
+      <div>Remote host: <b id="tHost" style="color:var(--ink)">—</b></div>
+    </div>
+    <details>
+      <summary>Diagnostics</summary>
+      <div class="dkv">
+        <span class="k">RTT</span><span class="v" id="dRtt">—</span>
+        <span class="k">One-way est.</span><span class="v" id="dOwLat">—</span>
+        <span class="k">Clock drift</span><span class="v" id="dDrift">—</span>
+        <span class="k">Decoded fps</span><span class="v" id="dFps">—</span>
+        <span class="k">TX fps</span><span class="v" id="dTxFps">—</span>
+        <span class="k">Queued groups</span><span class="v" id="dQ">—</span>
+        <span class="k">Ring overflows</span><span class="v" id="dOv">—</span>
+        <span class="k">PLC channels</span><span class="v" id="dPlc">—</span>
+        <span class="k">Seq missing</span><span class="v" id="dMiss">—</span>
+        <span class="k">Suggested buffer</span><span class="v" id="dSug">—</span>
+        <span class="k">Underflows</span><span class="v" id="dUf">—</span>
+        <span class="k">Uptime</span><span class="v" id="dUp">—</span>
+      </div>
+    </details>
+  </div>
+</section>
+<section id="txrouting" class="page routing">
+  <div class="route-toolbar">
+    <button class="route-btn" id="txBtn1to1" onclick="routeConfirm('txBtn1to1',doTx1to1)">1:1</button>
+    <button class="route-btn" id="txBtnClear" onclick="routeConfirm('txBtnClear',doTxClear)">Clear all</button>
+  </div>
+  <div class="matrix-outer"><table class="mx" id="txTable"><thead id="txHead"></thead><tbody id="txBody"></tbody></table></div>
+</section>
+<section id="rxrouting" class="page routing">
+  <div class="route-toolbar">
+    <button class="route-btn" id="rxBtn1to1" onclick="routeConfirm('rxBtn1to1',doRx1to1)">1:1</button>
+    <button class="route-btn" id="rxBtnClear" onclick="routeConfirm('rxBtnClear',doRxClear)">Clear all</button>
+  </div>
+  <div class="matrix-outer"><table class="mx" id="rxTable"><thead id="rxHead"></thead><tbody id="rxBody"></tbody></table></div>
+</section>
+<section id="meters" class="page">
+  <div class="card mb"><div class="ctitle">Send</div><div class="mbank" id="txMeters"></div></div>
+  <div class="card mb"><div class="ctitle">Receive</div><div class="mbank" id="rxMeters"></div></div>
+  <div class="card"><div class="ctitle">Output</div><div class="mbank" id="monMeters"></div></div>
+</section>
+<section id="setup" class="page">
+  <div class="sgrid mb">
+    <div class="card">
+      <div class="ctitle">This Node</div>
+      <div class="field">
+        <label>Device name</label>
+        <div class="idrow">
+          <input id="cfgNode" autocomplete="off" spellcheck="false" oninput="nodeNameDirty()">
+          <button class="cpybtn" onclick="copyFeedback(this,$('cfgNode').value)">⎘</button>
+          <button class="savebtn" id="nodeNameSave" onclick="saveNodeName()">Save</button>
+        </div>
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label>Device IP</label>
+        <div class="idrow">
+          <input id="deviceIpInput" readonly style="flex:1;color:var(--muted)">
+          <button class="cpybtn" onclick="copyFeedback(this,$('deviceIpInput').value)">⎘</button>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ctitle">Connect To</div>
+      <div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.remoteName=true"></div>
+      <div class="field" style="margin-bottom:0"><label>Remote IP</label><input id="cfgPeer" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.peer=true"></div>
+    </div>
+  </div>
+  <div class="sgrid mb" style="align-items:stretch">
+    <div class="card">
+      <div class="ctitle">Codec &amp; Transport</div>
+      <div class="crow"><span class="ck">Network send channels</span><span class="cv"><select id="cfgChannels" onchange="cfgDirty.channels=true"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></span></div>
+      <div class="crow"><span class="ck">Bitrate per channel</span><span class="cv"><select id="bitrate" onchange="cfgDirty.bitrate=true"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></span></div>
+      <div class="crow"><span class="ck">Incoming buffer</span><span class="cv"><select id="rxBuffer" onchange="cfgDirty.rxBuffer=true"><option value="5">5 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="160">160 ms</option><option value="200">200 ms</option><option value="300">300 ms</option><option value="500">500 ms</option><option value="1000">1 s</option><option value="2000">2 s</option></select></span></div>
+      <div class="crow"><span class="ck">Encoder</span><span class="cv"><select id="cfgEncoderMode" onchange="cfgDirty.encoderMode=true"><option value="music">Music</option><option value="speech">Voice</option></select></span></div>
+      <div class="crow"><span class="ck">Phase lock</span><span class="cv"><input type="checkbox" id="cfgPhaseLock" checked onchange="cfgDirty.phaseLock=true"></span></div>
+      <button class="applybtn" id="applyBtn" onclick="applySetup()">Apply &amp; rebuild engine</button>
+    </div>
+    <div class="card">
+      <div class="ctitle">Advanced</div>
+      <div id="modePill" class="mpill rdv" style="margin-top:0;margin-bottom:14px"><span class="mdot"></span><span id="modeLabel">Cloud</span></div>
+      <div class="field">
+        <label>Link password</label>
+        <div style="display:flex;gap:6px"><input id="cfgLinkPw" type="password" style="flex:1" oninput="cfgDirty.linkPw=true"><button id="pwToggleBtn" onclick="togglePw()" style="padding:7px 12px;flex-shrink:0;min-width:52px">Show</button></div>
+      </div>
+      <div class="field"><label>Token override</label><input id="cfgToken" autocomplete="off" spellcheck="false" placeholder="auto-derived" oninput="cfgDirty.token=true"></div>
+      <div class="field" style="margin-bottom:0"><label>Rendezvous server</label><input id="cfgRendezvous" autocomplete="off" oninput="cfgDirty.rendezvous=true"></div>
+    </div>
+  </div>
+  <div class="card"><div class="ctitle">Audio Devices</div><div id="devices"><div style="color:var(--muted);font-size:12px">Loading…</div></div></div>
+</section>
 </main>
 <script>
-let status={}, stats={}, matrix={sources:[],destinations:[],routes:[]}, devices={};
-let matrixRenderKey='', routeBusy=false, localOk=true;
-let cfgDirty={peer:false,node:false,token:false,channels:false,bitrate:false,rxBuffer:false};
-function markCfgDirty(id,key){let el=$(id); if(el) el.addEventListener('input',()=>cfgDirty[key]=true); if(el) el.addEventListener('change',()=>cfgDirty[key]=true);} 
-window.addEventListener('DOMContentLoaded',()=>{markCfgDirty('cfgRemoteName','remoteName');markCfgDirty('cfgPeer','peer');markCfgDirty('cfgNode','node');markCfgDirty('cfgLinkPw','linkPw');markCfgDirty('cfgToken','token');markCfgDirty('cfgRendezvous','rendezvous');markCfgDirty('cfgChannels','channels');markCfgDirty('bitrate','bitrate');markCfgDirty('rxBuffer','rxBuffer');});
 const $=id=>document.getElementById(id);
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// Tab routing
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab,.page').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.page).classList.add('active')});
-function setLocalOk(ok){localOk=ok;$('localLost').className='local-lost '+(ok?'':'show')}
-function lampClass(db){if(db>-10)return'red';if(db>-18)return'orange';if(db>=-90)return'green';return''}
-function setKv(id,pairs){$(id).innerHTML=pairs.map(([k,v])=>`<span>${k}</span><b>${v}</b>`).join('')}
-function pct(db){db=Math.max(-60,Math.min(0,db));return 100-((db+60)/60*100)}
-function meterColour(db){if(db>-10)return'red';if(db>-18)return'orange';return'green'}
-function segHeights(db){
-  if(!Number.isFinite(db)||db<=-100)return{g:0,o:0,r:0};
-  let shown=Math.max(-60,Math.min(0,db));
-  let g=Math.max(0,Math.min(shown,-18)-(-60))/60*100;
-  let o=Math.max(0,Math.min(shown,-10)-(-18))/60*100;
-  let r=Math.max(0,shown-(-10))/60*100;
-  return{g,o,r};
-}
-function meter(label,db,key,sublabel){let finite=Number.isFinite(db)&&db>-100;let shown=Math.max(-60,Math.min(0,finite?db:-120));let ticks=[0,-10,-18,-60].map(t=>`<div class="tick ${t===0||t===-60?'major':t===-18?'ref18':'ref10'}" style="top:${pct(t)}%">${t}</div>`).join('');let h=segHeights(db);let sub=sublabel?`<br><span style="font-size:10px;color:var(--muted);display:block;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:64px">${sublabel}</span>`:'';return `<div class="meter"><div class="barbox"><div class="seg green" style="height:${h.g}%"></div><div class="seg orange" style="bottom:${h.g}%;height:${h.o}%"></div><div class="seg red" style="bottom:${h.g+h.o}%;height:${h.r}%"></div><div class="ticks">${ticks}</div></div><div class="db">${finite?shown.toFixed(1):'−∞'} dBFS</div><div class="meterlabel">${label}${sub}</div></div>`}
-function routeSet(){return new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination))}
-function jsq(v){return JSON.stringify(v).replace(/</g,'\u003c')}
-async function toggleRoute(src,dst){if(routeBusy)return;routeBusy=true;try{let routes=[...(matrix.routes||[])];let key=src+'>'+dst;let i=routes.findIndex(r=>r.source+'>'+r.destination===key);if(i>=0)routes.splice(i,1);else routes.push({source:src,destination:dst});let body={routes};if(dst.startsWith('output:'))body.monitor_mode='patch_matrix';let res=await fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});matrix=await res.json();matrixRenderKey='';renderMatrices()}finally{routeBusy=false}}
-function matrixShapeKey(){return JSON.stringify({s:(matrix.sources||[]).map(s=>[s.id,s.label,s.kind]),d:(matrix.destinations||[]).map(d=>[d.id,d.label,d.kind]),r:(matrix.routes||[]).map(r=>[r.source,r.destination]).sort()})}
-function sourceDb(s){let m=s.id.match(/ch:(\d+)/);if(s.kind==='network_receive'&&m){let ch=parseInt(m[1]);return (stats.rx_peak_dbfs||[])[ch]??-120}if(s.kind==='test_tone'){if(s.id==='ebu:r')return -18;if(s.id==='ebu:l'){let pos=(Date.now()%3000);return pos<250?-120:-18;}return -120}if(s.kind==='physical_input'){let m=s.id.match(/^input:(\d+)$/);if(m){let ch=parseInt(m[1]);return (stats.input_peak_dbfs||[])[ch]??-120}}return -120}
-function updateSignalLamps(){document.querySelectorAll('[data-src-id]').forEach(el=>{let s=(matrix.sources||[]).find(x=>x.id===el.dataset.srcId);if(!s)return;el.className='sig '+lampClass(sourceDb(s));})}
-function sendChannelIndex(id){let m=id.match(/^stream:0:ch:(\d+)$/);return m?parseInt(m[1]):null}
-async function sendLocalLabels(){let txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');let labels=txDests.map(d=>{let idx=sendChannelIndex(d.id);let el=idx==null?null:document.querySelector(`[data-label-input="${idx}"]`);return el?el.value:d.label.replace(/^Send \d+ — /,'')});try{let res=await fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})});matrix=await res.json();matrixRenderKey='';renderMatrices()}catch(e){console.error(e)}}
-function destHeader(d){let idx=sendChannelIndex(d.id);if(idx==null)return d.label;let current=d.label.replace(/^Send \d+ — /,'');return `<div class="send-head"><div>Send ${idx+1}</div><input data-label-input="${idx}" value="${current.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}" onchange="sendLocalLabels()" onkeydown="if(event.key==='Enter')this.blur()" onclick="event.stopPropagation()"></div>`}
-function kindLabel(k){return{network_send:'Send',network_receive:'Receive',physical_input:'Local Input',physical_output:'Local Output',test_tone:'Test Tone'}[k]||k.replaceAll('_',' ')}
-function matrixTable(title,sources,destinations,emptyText){if(!sources.length||!destinations.length)return `<div class="empty-note">${emptyText}</div>`;let set=routeSet();let html='<div class="matrix-wrap"><table class="matrix"><thead><tr><th></th>'+destinations.map(d=>`<th>${destHeader(d)}</th>`).join('')+'</tr></thead><tbody>';sources.forEach(s=>{html+=`<tr><th class="rowhead"><span data-src-id="${s.id}" class="sig ${lampClass(sourceDb(s))}"></span>${s.label}<br><small>${kindLabel(s.kind)}</small></th>`;destinations.forEach(d=>{let on=set.has(s.id+'>'+d.id);html+=`<td class="xcell ${on?'on':''}" onclick='toggleRoute(${jsq(s.id)},${jsq(d.id)})' title="${s.label} → ${d.label}"></td>`});html+='</tr>'});return html+'</tbody></table></div>'}
-function renderMatrices(){let key=matrixShapeKey();if(key===matrixRenderKey){updateSignalLamps();return}matrixRenderKey=key;let sources=matrix.sources||[], destinations=matrix.destinations||[];let txSources=sources.filter(s=>['test_tone','physical_input'].includes(s.kind));let txDests=destinations.filter(d=>d.kind==='network_send');let rxSources=sources.filter(s=>s.kind==='network_receive');let rxDests=destinations.filter(d=>d.kind==='physical_output');$('txMatrix').innerHTML=matrixTable('Send Routing',txSources,txDests,'No send channels');$('rxMatrix').innerHTML=matrixTable('Receive Routing',rxSources,rxDests,'No receive sources')}
-function setRemoteAlert(st){let alert=$('topAlert'), banner=$('remoteBanner');let isGood=st==='green';let msg=st==='orange'?'REMOTE DEVICE DEGRADED':'REMOTE DEVICE OFFLINE';alert.className='topalert '+(isGood?'':'show ')+(st==='orange'?'orange':'');alert.textContent=msg;banner.className='remotealert';banner.textContent=''}
-function setSelectValue(id,value){let el=$(id);if(!el)return;let v=String(value);if([...el.options].some(o=>o.value===v||o.text===v))el.value=v}
-function shellQuote(v){return "'"+String(v).replace(/'/g,"'\''")+"'"}
-function showRestartCommand(){let peer=$('cfgPeer').value||status.runtime?.remote_host||'';let node=$('cfgNode').value||status.node_id||'';let remoteName=$('cfgRemoteName').value||status.runtime?.remote_device_name||'';let channels=$('cfgChannels').value||status.local_channels||2;let bitrate=$('bitrate').value||status.runtime?.opus_bitrate_per_channel||128000;let rxBuffer=$('rxBuffer').value||status.runtime?.latency_ms||120;let cmd=`audiolinkd bidir --remote-name ${shellQuote(remoteName)}${peer?' --remote-host '+shellQuote(peer.split(':')[0]):''}  --channels ${channels} --id ${shellQuote(node)} --bitrate ${bitrate} --latency-ms ${rxBuffer}`;$('restartCommand').textContent=cmd}
-async function applySetup(){let body={remote:$('cfgPeer').value,remote_device_name:$('cfgRemoteName').value,link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value),opus_bitrate_per_channel:Number($('bitrate').value),receive_buffer_ms:Number($('rxBuffer').value),rendezvous_url:$('cfgRendezvous').value||undefined};$('restartCommand').textContent='Applying…';try{let res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});let txt=await res.text();if(!res.ok){$('restartCommand').textContent=txt;return}cfgDirty={peer:false,node:false,remoteName:false,linkPw:false,token:false,channels:false,bitrate:false,rxBuffer:false,rendezvous:false};$('restartCommand').textContent='Engine rebuilding — reconnecting shortly.'}catch(e){$('restartCommand').textContent='Apply failed: '+e}}
-function togglePwVis(){let f=$('cfgLinkPw');f.type=f.type==='password'?'text':'password';}
-function render(){setLocalOk(true);let dev=status.remote||{};let st=status.peer_status||'gray';let conflict=status.remote_conflict;$('peerLamp').className='lamp '+(st==='green'?'green':st==='orange'?'orange':'');let connText=st==='green'?('Connected — auto-handshake established'+(dev.node_id?' with '+dev.node_id:'')):st==='orange'?'Remote device degraded':'Remote device offline';$('peerText').textContent=connText;if(conflict){$('peerText').textContent='Connection conflict — '+conflict+' attempted to connect while already connected to '+(dev.node_id||'another device')}setRemoteAlert(st);$('nodeLine').textContent=`Node ${status.node_id||''} · ${status.monitor_mode||''}`;setKv('localKv',[['Device Name',status.node_id||'—'],['Mode','Bidirectional'],['Source',status.runtime?.source||'—'],['Network send channels',status.local_channels??'—'],['Opus bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—'],['Local inputs',status.local_input_channels??0],['Monitor',status.monitor_mode||'—']]);setKv('peerKv',[['Remote device name',dev.node_id||status.runtime?.remote_device_name||'—'],['Remote host',status.runtime?.remote_host||'—'],['RX channels',status.remote_channels??0],['Status',status.peer_status||'gray'],['Last keepalive',status.last_control_age_ms!=null?Math.round(status.last_control_age_ms/100)/10+' s ago':'—'],['Last audio',status.last_audio_age_ms!=null?Math.round(status.last_audio_age_ms/100)/10+' s ago':'—'],['Metadata',dev.labels?dev.labels.join(', '):'—']]);setKv('statsKv',[['TX rate',((stats.tx_mbps??0)).toFixed(3)+' Mb/s'],['RX rate',((stats.rx_mbps??0)).toFixed(3)+' Mb/s'],['Packet loss',((stats.loss_percent??0)).toFixed(3)+' %'],['Missing packets',stats.seq_missing??0],['Jitter',((stats.jitter_ms??0)).toFixed(2)+' ms'],['RTT',stats.rtt_ms?(stats.rtt_ms.toFixed(1)+' ms'):'not measured yet'],['Estimated one-way latency',stats.one_way_latency_ms?(stats.one_way_latency_ms.toFixed(1)+' ms'):'pending'],['Incoming audio buffer',(stats.fill_ms??0)+' ms'],['Configured buffer',(status.runtime?.latency_ms??'—')+' ms'],['Effective target buffer',(stats.target_ms??status.runtime?.effective_latency_ms??'—')+' ms'],['Estimated audio latency',stats.one_way_latency_ms&&stats.fill_ms?(((stats.one_way_latency_ms)+(stats.fill_ms??0)).toFixed(1)+' ms'):'pending'],['Drift pressure',(stats.drift_pressure_ppm??0)+' ppm'],['Decoded fps',(stats.decoded_fps??0).toFixed(1)],['TX fps',(stats.tx_fps??0).toFixed(1)],['Queued groups',stats.queued_groups??0],['Output underflows',stats.output_underflows??0],['PLC channels',stats.plc_channels??0],['Ring overflows',stats.ring_overflows??0]]);setKv('audioKv',[['Codec','Opus'],['Bitrate',status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s per channel':'—'],['Frame','20 ms / 960 samples'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured / '+(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms effective'],['Phase lock',stats.phase_lock?'on':'off'],['Generator','EBU R49']]);if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.node)$('cfgNode').value=status.node_id||'';if(!cfgDirty.token)$('cfgToken').value='';if(!cfgDirty.rendezvous)$('cfgRendezvous').value=status.runtime?.rendezvous_url||'';if(!cfgDirty.linkPw){$('cfgLinkPw').value='';$('cfgLinkPw').placeholder=status.runtime?.link_password_configured?'Password is set — enter new password to change, or leave blank to keep':'Leave blank if not required';}if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels??2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel??128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms??120);setKv('setupLink',[['Remote device name',status.runtime?.remote_device_name||'not configured'],['Remote host (initiator only)',status.runtime?.remote_host||'blank (responder mode)'],['Rendezvous server',status.runtime?.rendezvous_url||'not configured'],['Current device name',status.node_id||'—'],['Incoming buffer',(status.runtime?.latency_ms??'—')+' ms configured'],['Effective buffer',(status.runtime?.effective_latency_ms??stats.target_ms??'—')+' ms'],['Config file','audiolinkd_config.json']]);$('devices').innerHTML=`<div class="kv"><span>Sample rate</span><b>${devices.sample_rate||48000} Hz</b><span>Default input</span><b>${devices.default_input||'none'}</b><span>Input channels</span><b>${devices.default_input_channels??0}</b><span>Default output</span><b>${devices.default_output||'none'}</b><span>Output channels</span><b>${devices.default_output_channels??0}</b></div><h3>Inputs</h3><p>${(devices.inputs||[]).join('<br>')||'none'}</p><h3>Outputs</h3><p>${(devices.outputs||[]).join('<br>')||'none'}</p>`;let txLabels=(matrix.destinations||[]).filter(d=>d.kind==='network_send').map(d=>d.label.replace(/^Send \d+ — /,''));let rxLabels=(matrix.sources||[]).filter(s=>s.kind==='network_receive').map(s=>s.label.replace(/^\S+ /,''));$('txMeters').innerHTML=(stats.tx_peak_dbfs||[]).map((v,i)=>meter('Send '+(i+1),v,'tx'+i,txLabels[i]||'')).join('')||'<p class="note">No send channels</p>';let remoteOnline=(st==='green'||st==='orange')&&(status.remote_channels||0)>0;$('rxMeters').innerHTML=remoteOnline?(stats.rx_peak_dbfs||[]).map((v,i)=>meter('Receive '+(i+1),v,'rx'+i,rxLabels[i]||'')).join(''):'<div class="empty-note">No connected remote device</div>';$('monMeters').innerHTML=(stats.monitor_peak_dbfs||[-120,-120]).map((v,i)=>meter(i?'Local Output 2':'Local Output 1',v,'mon'+i)).join('');renderMatrices()}
-async function loadDevices(){try{devices=await fetch('/api/audio/devices').then(r=>r.json())}catch(e){console.error(e)}}
-async function poll(){try{[status,stats,matrix]=await Promise.all([fetch('/api/status').then(r=>r.json()),fetch('/api/stats').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);render()}catch(e){console.error(e);setLocalOk(false)}}
-loadDevices().then(poll);setInterval(poll,100);
+// Theme
+const mq=window.matchMedia('(prefers-color-scheme: dark)');
+let dark;
+function applyTheme(isDark,save){dark=isDark;document.body.classList.toggle('light',!isDark);$('themeBtn').textContent=isDark?'☀ Light':'☾ Dark';if(save)localStorage.setItem('al-theme',isDark?'dark':'light')}
+const savedTheme=localStorage.getItem('al-theme');
+applyTheme(savedTheme?savedTheme==='dark':mq.matches,false);
+mq.addEventListener('change',e=>{if(!localStorage.getItem('al-theme'))applyTheme(e.matches,false)});
+function toggleTheme(){applyTheme(!dark,true)}
+// State
+let status={},stats={},matrix={sources:[],destinations:[],routes:[]},devices={};
+let cfgDirty={};
+let savedNodeName='';
+let matrixLastKey='';
+let routeBusy=false;
+const armTimers={};
+// Helpers
+function setSelectValue(id,value){const el=$(id);if(!el)return;const v=String(value);if([...el.options].some(o=>o.value===v||o.text===v))el.value=v}
+function copyFeedback(btn,text){navigator.clipboard?.writeText(text).then(()=>{btn.textContent='✓';setTimeout(()=>btn.textContent='⎘',1500)})}
+function rttCls(ms){return ms>100?'bad':ms>40?'warn':'ok'}
+function lossCls(p){return p>2?'bad':p>.5?'warn':'ok'}
+// Double-tap confirm
+function routeConfirm(btnId,action){if(armTimers[btnId]){clearTimeout(armTimers[btnId]);delete armTimers[btnId];$(btnId).classList.remove('arm');action()}else{$(btnId).classList.add('arm');armTimers[btnId]=setTimeout(()=>{$(btnId).classList.remove('arm');delete armTimers[btnId]},3000)}}
+// Setup
+function updateMode(){const ip=($('cfgPeer').value||'').trim(),nm=($('cfgRemoteName').value||'').trim(),p=$('modePill'),l=$('modeLabel');if(ip){p.className='mpill dir';l.textContent='Direct IP'}else if(nm){p.className='mpill rdv';l.textContent='Cloud'}else{p.className='mpill pas';l.textContent='Passive'}}
+function nodeNameDirty(){cfgDirty.node=true;$('nodeNameSave').classList.toggle('show',$('cfgNode').value!==savedNodeName)}
+function saveNodeName(){const n=$('cfgNode').value.trim();if(!n)return;savedNodeName=n;$('nodeNameSave').classList.remove('show');$('nodeLine').textContent=n}
+function togglePw(){const f=$('cfgLinkPw'),b=$('pwToggleBtn');f.type=f.type==='password'?'text':'password';b.textContent=f.type==='password'?'Show':'Hide'}
+async function applySetup(){const btn=$('applyBtn');if(btn.classList.contains('done'))return;if(btn.classList.contains('arm')){clearTimeout(btn._armTimer);btn.classList.remove('arm');btn.disabled=true;btn.textContent='Rebuilding…';const body={remote:$('cfgPeer').value||'',remote_device_name:$('cfgRemoteName').value||'',link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value||savedNodeName,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value)||2,opus_bitrate_per_channel:Number($('bitrate').value)||128000,receive_buffer_ms:Number($('rxBuffer').value)||120,rendezvous_url:$('cfgRendezvous').value||undefined,phase_lock:$('cfgPhaseLock').checked,encoder_mode:$('cfgEncoderMode').value};try{const res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const txt=await res.text();if(res.ok){btn.textContent='✓ Engine rebuilding';btn.classList.add('done');btn.disabled=false;setTimeout(()=>{btn.classList.remove('done');btn.textContent='Apply & rebuild engine'},3000)}else{btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+txt)}}catch(e){btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+e)}}else{btn.classList.add('arm');btn.textContent='Confirm rebuild';btn._armTimer=setTimeout(()=>{btn.classList.remove('arm');btn.textContent='Apply & rebuild engine'},3000)}}
+function updateSetupFromStatus(){if(!cfgDirty.node){$('cfgNode').value=status.node_id||'';if(!savedNodeName)savedNodeName=status.node_id||''}if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.rendezvous)$('cfgRendezvous').value=status.runtime?.rendezvous_url||'';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels||2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel||128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms||120);if(!cfgDirty.encoderMode)setSelectValue('cfgEncoderMode',status.runtime?.encoder_mode||'music');if(!cfgDirty.phaseLock){const pl=$('cfgPhaseLock');if(pl)pl.checked=status.runtime?.phase_lock!==false}updateMode()}
+// Home render
+function render(){const st=status.peer_status||'gray';const remote=status.remote||{};const badge=$('connBadge'),lamp=$('peerLamp'),pt=$('peerText');if(st==='green'){badge.className='conn-badge green';lamp.className='lamp green';pt.textContent='Connected — '+(remote.node_id||'remote device');$('alertbar').className='alertbar'}else if(st==='orange'){badge.className='conn-badge orange';lamp.className='lamp orange';pt.textContent='Remote device degraded';$('alertbar').className='alertbar degraded show';$('alertbar').textContent='REMOTE DEVICE DEGRADED'}else{badge.className='conn-badge gray';lamp.className='lamp gray';pt.textContent='No connected device';$('alertbar').className='alertbar offline show';$('alertbar').textContent='REMOTE DEVICE OFFLINE'}
+$('localName').textContent=status.node_id||'—';$('nodeLine').textContent=status.node_id||'—';$('localCh').textContent=(status.local_channels||0)+' ch';$('localBr').textContent=status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—';$('localCodec').textContent=status.runtime?.encoder_mode||'music';const plc=$('localPl');if(status.runtime?.phase_lock!==false){plc.textContent='phase lock';plc.className='nsub-chip live'}else{plc.textContent='no phase lock';plc.className='nsub-chip'}
+const rn=$('remoteNameHome');if(st!=='gray'){rn.textContent=remote.node_id||status.runtime?.remote_device_name||'—';rn.style.color='var(--ink)';const chips=[];if((remote.channels||0)>0)chips.push(remote.channels+' ch RX');if(remote.labels?.length>0)chips.push(remote.labels.slice(0,4).join(', ')+(remote.labels.length>4?'…':''));$('remoteChips').innerHTML=chips.map(c=>`<span class="nsub-chip">${esc(c)}</span>`).join('')}else{rn.textContent='—';rn.style.color='var(--muted)';$('remoteChips').innerHTML=''}
+const ow=stats.one_way_latency_ms||0;$('owVal').innerHTML=ow.toFixed(1)+'<span class="u"> ms</span>';$('owVal').className='sval '+rttCls(ow);$('txBw').textContent=(stats.tx_mbps||0).toFixed(3);$('rxBw').textContent=(stats.rx_mbps||0).toFixed(3);const loss=stats.loss_percent||0;$('lossVal').innerHTML=loss.toFixed(2)+'<span class="u"> %</span>';$('lossVal').className='sval '+lossCls(loss);const jit=stats.jitter_ms||0;$('jitterVal').innerHTML=jit.toFixed(1)+'<span class="u"> ms</span>';$('jitterVal').className='sval '+(jit>20?'warn':'ok');
+const fill=stats.fill_ms||0,target=stats.target_ms||status.runtime?.latency_ms||120,MAX=200;const fp=Math.min(100,fill/MAX*100),tp=Math.min(100,target/MAX*100);const bf=$('bufFill');bf.style.width=fp+'%';bf.className='buffill'+(fill<20?' bad':fill<60?' warn':'');$('bufTick').style.left=tp+'%';$('bufTickLbl').textContent=target+' ms';$('fillMs').textContent=fill.toFixed?fill.toFixed(0):fill;$('targetMs').textContent=target;
+$('tMode').textContent=status.runtime?.remote_host?'direct':'cloud';$('tHost').textContent=status.runtime?.remote_host||'—';
+$('dRtt').textContent=(stats.rtt_ms||0).toFixed(1)+' ms';$('dOwLat').textContent=(stats.one_way_latency_ms||0).toFixed(1)+' ms';const d=stats.drift_pressure_ppm||0;$('dDrift').textContent=(d>=0?'+':'')+d+' ppm';$('dFps').textContent=(stats.decoded_fps||0).toFixed(1);$('dTxFps').textContent=(stats.tx_fps||0).toFixed(1);$('dQ').textContent=stats.queued_groups||0;$('dOv').textContent=stats.ring_overflows||0;$('dPlc').textContent=stats.plc_channels||0;$('dMiss').textContent=stats.seq_missing||0;$('dSug').textContent=stats.recommended_buffer_ms?stats.recommended_buffer_ms+' ms':'—';$('dUf').textContent=stats.output_underflows||0;$('dUp').textContent=(status.uptime_seconds||0)+' s';
+renderMeters();updateSetupFromStatus()}
+// Meters
+const DB_FLOOR=-60,DB_RANGE=60,DB_G=-18,DB_O=-10;
+function segH(db){if(!Number.isFinite(db)||db<=DB_FLOOR-.5)return{g:0,o:0,r:0};const s=Math.max(DB_FLOOR,Math.min(0,db));return{g:Math.max(0,(Math.min(s,DB_G)-DB_FLOOR)/DB_RANGE*100),o:Math.max(0,(Math.min(s,DB_O)-DB_G)/DB_RANGE*100),r:Math.max(0,(s-DB_O)/DB_RANGE*100)}}
+function dbTop(db){return(1-(db-DB_FLOOR)/DB_RANGE)*100}
+function makeMeter(lbl,key,ticks){const t=ticks?`<div class="barticks"><div class="tlbl hi" style="top:${dbTop(0)}%">0</div><div class="tlbl" style="top:${dbTop(DB_O)}%">-10</div><div class="tlbl" style="top:${dbTop(DB_G)}%">-18</div><div class="tlbl" style="top:${dbTop(DB_FLOOR)}%">-60</div></div>`:'';return`<div class="meter"><div class="bartrack" style="${ticks?'margin-left:32px':''}">${t}<div class="sg" id="sg_${key}" style="height:0"></div><div class="so" id="so_${key}" style="height:0;bottom:0"></div><div class="sr" id="sr_${key}" style="height:0;bottom:0"></div></div><div class="mdb" id="mdb_${key}">−∞</div><div class="mlbl">${lbl}</div></div>`}
+function updateMeter(key,db){const{g,o,r}=segH(db);const G=$('sg_'+key),O=$('so_'+key),R=$('sr_'+key),D=$('mdb_'+key);if(!G)return;G.style.height=g+'%';G.style.bottom='0';O.style.height=o+'%';O.style.bottom=g+'%';R.style.height=r+'%';R.style.bottom=(g+o)+'%';if(D)D.textContent=db>-100?db.toFixed(1):'−∞'}
+function renderMeters(){const txPeaks=stats.tx_peak_dbfs||[];const rxPeaks=stats.rx_peak_dbfs||[];const monPeaks=stats.monitor_peak_dbfs||[-120,-120];const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');const txN=Math.max(txPeaks.length,txDests.length,1);const rxN=Math.max(rxPeaks.length,rxSrcs.length);const txBank=$('txMeters'),rxBank=$('rxMeters'),monBank=$('monMeters');if(!txBank)return;const txKey='tx'+txN+(txDests.map(d=>d.label).join('|'));if(txBank.dataset.key!==txKey){txBank.innerHTML=txDests.map((d,i)=>{const lbl=d.label.replace(/^Send \d+ — /,'');return makeMeter('Ch '+(i+1)+(lbl?' — '+lbl:''),`tx${i}`,i===0)}).join('')||makeMeter('Ch 1','tx0',true);txBank.dataset.key=txKey}if(rxBank.dataset.key!==String(rxN)){rxBank.innerHTML=rxN>0?Array.from({length:rxN},(_,i)=>makeMeter('Ch '+(i+1),`rx${i}`,i===0)).join(''):'<div style="color:var(--muted);font-size:12px;padding:4px">No receive</div>';rxBank.dataset.key=String(rxN)}if(!monBank.children.length){monBank.innerHTML=makeMeter('L','mn0',true)+makeMeter('R','mn1',false)}txPeaks.forEach((v,i)=>updateMeter('tx'+i,v));rxPeaks.forEach((v,i)=>updateMeter('rx'+i,v));[monPeaks[0]??-120,monPeaks[1]??-120].forEach((v,i)=>updateMeter('mn'+i,v))}
+// Hover highlight
+function setupHover(tableId){const tbl=$(tableId);if(!tbl)return;let pRow=null,pCols=[];function clear(){if(pRow)pRow.classList.remove('hl-row');pCols.forEach(c=>c.classList.remove('hl-col'));pRow=null;pCols=[]}tbl.addEventListener('mouseover',e=>{const cell=e.target.closest('td,th');if(!cell)return;clear();const tr=cell.parentElement;if(tr.parentElement.tagName==='TBODY'){tr.classList.add('hl-row');pRow=tr}const col=cell.cellIndex;const cols=Array.from(tbl.querySelectorAll(`tr>*:nth-child(${col+1})`));cols.forEach(c=>c.classList.add('hl-col'));pCols=cols});tbl.addEventListener('mouseleave',clear)}
+// Source user labels (client-side, synced from API dest labels on each render)
+const srcUserLabels={};
+function getSrcLabel(srcId){// Derive from the dest channel this source is routed to (if any)
+const route=(matrix.routes||[]).find(r=>r.source===srcId&&r.destination.startsWith('stream:0:ch:'));if(route){const dest=(matrix.destinations||[]).find(d=>d.id===route.destination);if(dest)return dest.label.replace(/^Send \d+ — /,'')}return srcUserLabels[srcId]||''}
+function getColLabel(destId){// Derive from the single source routed to this dest (if exactly one)
+const routes=(matrix.routes||[]).filter(r=>r.destination===destId&&!r.source.startsWith('ebu:'));if(routes.length!==1)return'';const lbl=getSrcLabel(routes[0].source);return lbl}
+async function saveSrcLabel(srcId,label){srcUserLabels[srcId]=label;const dest=(matrix.routes||[]).find(r=>r.source===srcId&&r.destination.startsWith('stream:0:ch:'));if(!dest)return;const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const labels=txDests.map(d=>{const r=(matrix.routes||[]).find(rx=>rx.destination===d.id&&!rx.source.startsWith('ebu:'));if(r&&r.source===srcId)return label;return d.label.replace(/^Send \d+ — /,'')});try{const res=await fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})});matrix=await res.json();matrixLastKey='';buildMatrices()}catch(e){console.error(e)}}
+// Route toggle (shared async)
+async function doRouteToggle(srcId,destId,routeSet,isRx){if(routeBusy)return;routeBusy=true;try{let routes=[...(matrix.routes||[])];const key=srcId+'>'+destId;const i=routes.findIndex(r=>r.source===srcId&&r.destination===destId);if(i>=0)routes.splice(i,1);else routes.push({source:srcId,destination:destId});const body={routes};if(destId.startsWith('output:'))body.monitor_mode='patch_matrix';const res=await fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});matrix=await res.json();matrixLastKey='';buildMatrices()}finally{routeBusy=false}}
+// Send routing
+function buildTxTable(){const txSrcsReg=(matrix.sources||[]).filter(s=>s.kind==='physical_input');const txSrcsUtil=(matrix.sources||[]).filter(s=>s.kind==='test_tone');const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const activeRoutes=new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination));const numCh=txDests.length;if(!numCh){$('txBody').innerHTML='<tr><td style="padding:16px;color:var(--muted);font-size:12px" colspan="1">No send channels configured</td></tr>';$('txHead').innerHTML='';return}let hRow=`<tr><th class="rh"></th>`;txDests.forEach((d,i)=>{const lbl=getColLabel(d.id);hRow+=`<th><div class="ch-hdr"><div class="ch-hdr-num">${i+1}</div><div class="ch-hdr-lbl" id="chlbl_${esc(d.id)}">${esc(lbl)}</div></div></th>`});hRow+='</tr>';$('txHead').innerHTML=hRow;let rows='';function srcRow(src,editable){const lbl=editable?getSrcLabel(src.id):'';const labelPart=editable?`<span class="src-sep">•</span><input class="src-label-input" data-src="${esc(src.id)}" value="${esc(lbl)}" maxlength="20" spellcheck="false" autocomplete="off" placeholder="label…">`:'';rows+=`<tr><td class="rh"><div class="src-row"><span class="rsig ${src.kind==='test_tone'?'live':''}"></span><span class="src-sysname">${esc(src.kind==='physical_input'?src.label.replace('Local Input','Local In'):src.label)}</span>${labelPart}</div></td>`;txDests.forEach(d=>{const on=activeRoutes.has(src.id+'>'+d.id);rows+=`<td class="xcell${on?' on':''}" data-src="${esc(src.id)}" data-dst="${esc(d.id)}"></td>`});rows+='</tr>'}txSrcsReg.forEach(s=>srcRow(s,true));if(txSrcsUtil.length){rows+=`<tr class="src-spacer"><td class="rh" style="height:10px"></td>${'<td style="height:10px;background:var(--bg)"></td>'.repeat(numCh)}</tr>`;txSrcsUtil.forEach(s=>srcRow(s,false))}$('txBody').innerHTML=rows;const inputs=Array.from(document.querySelectorAll('#txBody .src-label-input'));inputs.forEach((el,idx)=>{el.addEventListener('focus',()=>el.select());el.addEventListener('input',()=>{el.classList.add('dirty');srcUserLabels[el.dataset.src]=el.value;refreshTxColHeaders()});el.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();saveSrcLabel(el.dataset.src,el.value);const nx=inputs[idx+1];nx?nx.focus():el.blur()}if(e.key==='Escape'){el.value=getSrcLabel(el.dataset.src);el.classList.remove('dirty');el.blur()}});el.addEventListener('blur',()=>{if(el.classList.contains('dirty')){saveSrcLabel(el.dataset.src,el.value);el.classList.remove('dirty')}})});$('txBody').addEventListener('click',e=>{const cell=e.target.closest('.xcell');if(cell)doRouteToggle(cell.dataset.src,cell.dataset.dst)});setupHover('txTable')}
+function refreshTxColHeaders(){const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');txDests.forEach(d=>{const el=document.getElementById('chlbl_'+d.id);if(el)el.textContent=getColLabel(d.id)})}
+// 1:1 and clear for TX
+function doTx1to1(){const txSrcsReg=(matrix.sources||[]).filter(s=>s.kind==='physical_input');const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');let routes=[...(matrix.routes||[]).filter(r=>r.source.startsWith('ebu:'))];// Keep EBU routes
+const n=Math.min(txSrcsReg.length,txDests.length);for(let i=0;i<n;i++)routes.push({source:txSrcsReg[i].id,destination:txDests[i].id});fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+function doTxClear(){const routes=(matrix.routes||[]).filter(r=>r.source.startsWith('ebu:'));// Keep EBU routes
+fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+// Receive routing
+function buildRxTable(){const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');const activeRoutes=new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination));const numOut=rxDests.length;if(!rxSrcs.length||!numOut){$('rxHead').innerHTML=`<tr><th class="rh"></th></tr>`;$('rxBody').innerHTML='<tr><td style="padding:16px;color:var(--muted);font-size:12px" colspan="1">No connected remote device</td></tr>';return}let hRow=`<tr><th class="rh"></th>`;rxDests.forEach(d=>{const n=d.label.replace('Local Output ','Out ');hRow+=`<th><div class="ch-hdr"><div class="ch-hdr-num">${esc(n)}</div></div></th>`});hRow+='</tr>';$('rxHead').innerHTML=hRow;let rows='';rxSrcs.forEach(src=>{// Format: "DeviceName Ch N" — show as "DeviceName • Ch N"
+const parts=src.label.match(/^(.+?)\s+(Ch\s+\d+)$/i);const sysName=parts?parts[1]:src.label;const chName=parts?parts[2]:'';const labelPart=chName?`<span class="src-sep">•</span><span style="font-size:11px;font-weight:600;color:var(--ink)">${esc(chName)}</span>`:'';rows+=`<tr><td class="rh"><div class="src-row"><span class="rsig"></span><span class="src-sysname">${esc(sysName)}</span>${labelPart}</div></td>`;rxDests.forEach(d=>{const on=activeRoutes.has(src.id+'>'+d.id);rows+=`<td class="xcell${on?' on':''}" data-src="${esc(src.id)}" data-dst="${esc(d.id)}"></td>`});rows+='</tr>'});$('rxBody').innerHTML=rows;$('rxBody').addEventListener('click',e=>{const cell=e.target.closest('.xcell');if(cell)doRouteToggle(cell.dataset.src,cell.dataset.dst,null,true)});setupHover('rxTable')}
+function doRx1to1(){const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');const nonRx=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));const routes=[...nonRx];const n=Math.min(rxSrcs.length,rxDests.length);for(let i=0;i<n;i++)routes.push({source:rxSrcs[i].id,destination:rxDests[i].id,monitor_mode:'patch_matrix'});fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes,monitor_mode:'patch_matrix'})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+function doRxClear(){const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+// Matrix shape key — only rebuild tables when structure changes
+function matrixKey(){return JSON.stringify({s:(matrix.sources||[]).map(s=>s.id+s.kind),d:(matrix.destinations||[]).map(d=>d.id+d.label),r:(matrix.routes||[]).map(r=>r.source+r.destination).sort()})}
+function buildMatrices(){const k=matrixKey();if(k===matrixLastKey){refreshTxColHeaders();return}matrixLastKey=k;buildTxTable();buildRxTable()}
+// Audio devices
+function renderDevices(){$('devices').innerHTML=`<div class="devrow"><span class="dk">Sample rate</span><b>${devices.sample_rate||48000} Hz</b></div><div class="devrow"><span class="dk">Default input</span><b>${esc(devices.default_input||'none')}</b></div><div class="devrow"><span class="dk">Input channels</span><b>${devices.default_input_channels??0}</b></div><div class="devrow"><span class="dk">Default output</span><b>${esc(devices.default_output||'none')}</b></div><div class="devrow"><span class="dk">Output channels</span><b>${devices.default_output_channels??0}</b></div>`}
+// Poll
+async function poll(){try{[status,stats,matrix]=await Promise.all([fetch('/api/status').then(r=>r.json()),fetch('/api/stats').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);render();buildMatrices()}catch(e){console.error(e)}}
+// Init
+fetch('/api/device-ip').then(r=>r.json()).then(d=>{$('deviceIpInput').value=d.ip||'unknown'}).catch(()=>{$('deviceIpInput').value='unknown'});
+fetch('/api/audio/devices').then(r=>r.json()).then(d=>{devices=d;renderDevices()}).catch(console.error);
+poll();setInterval(poll,200);
 </script>
 </body></html>"##.to_string())
 }
@@ -1496,9 +1976,9 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
     let remote = req.remote.trim();
     let remote_device_name = req.remote_device_name.trim();
     let node_id = req.node_id.trim();
-    if remote_device_name.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Remote device name is required").into_response();
-    }
+    // Remote device name is optional: blank = passive responder mode (no rendezvous lookup).
+    // Both node_id and at least one of remote_device_name/remote must be non-empty for
+    // a useful link, but the engine will start and await an initiator either way.
     if node_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "Device name is required").into_response();
     }
@@ -1514,6 +1994,12 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
             Ok(token) => (token_to_hex(&token), false),
             Err(e) => return (StatusCode::BAD_REQUEST, format!("Invalid explicit token: {e}")).into_response(),
         }
+    } else if remote_device_name.is_empty() {
+        // No remote device name: passive/open mode — use the dev default token.
+        // This is intentional: the operator will connect any initiator that presents
+        // the matching default token. For production use, set a link password or
+        // configure both device names.
+        (token_to_hex(&DEFAULT_SHARED_TOKEN), false)
     } else {
         let token = derive_link_token(node_id, remote_device_name, if link_password.is_empty() { None } else { Some(link_password) });
         (token_to_hex(&token), true)
@@ -1532,8 +2018,6 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
 
     let mut args = vec![
         "bidir".to_string(),
-        "--remote-name".to_string(),
-        remote_device_name.to_string(),
         "--channels".to_string(),
         req.channels.to_string(),
         "--id".to_string(),
@@ -1547,6 +2031,11 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
         "--monitor".to_string(),
         "matrix".to_string(),
     ];
+    // Remote device name is optional — blank = passive responder.
+    if !remote_device_name.is_empty() {
+        args.insert(1, remote_device_name.to_string());
+        args.insert(1, "--remote-name".to_string());
+    }
     // Remote host is optional — blank means responder mode.
     if !remote.is_empty() {
         args.push("--remote-host".to_string());
@@ -1561,7 +2050,15 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
         args.push(url.to_string());
     }
     if state.runtime.fixed_jitter { args.push("--fixed-jitter".to_string()); }
-    if !state.runtime.phase_lock { args.push("--no-phase-lock".to_string()); }
+    // phase_lock comes from the request if present; otherwise preserves the current runtime value.
+    let phase_lock = req.phase_lock.unwrap_or(state.runtime.phase_lock);
+    if !phase_lock { args.push("--no-phase-lock".to_string()); }
+    // encoder_mode: parse the request string, fall back to current runtime value.
+    let encoder_mode = req.encoder_mode.as_deref()
+        .map(EncoderMode::parse)
+        .unwrap_or_else(|| EncoderMode::parse(&state.runtime.encoder_mode));
+    args.push("--encoder-mode".to_string());
+    args.push(encoder_mode.as_str().to_string());
     if !state.runtime.send_enabled { args.push("--no-send".to_string()); }
     if !state.runtime.recv_enabled { args.push("--no-recv".to_string()); }
 
@@ -1602,7 +2099,8 @@ async fn setup_apply_handler(State(state): State<WebState>, Json(req): Json<Setu
         opus_bitrate_per_channel: Some(req.opus_bitrate_per_channel),
         latency_ms: Some(receive_buffer_ms),
         fixed_jitter: Some(state.runtime.fixed_jitter),
-        phase_lock: Some(state.runtime.phase_lock),
+        phase_lock: Some(phase_lock),
+        encoder_mode: Some(encoder_mode),
         channel_labels: None, // preserved by save_persisted_config — not overwritten here
         rendezvous_url: req.rendezvous_url.clone().filter(|u| !u.trim().is_empty()),
     });
@@ -1665,6 +2163,26 @@ async fn devices_handler(State(state): State<WebState>) -> Json<DeviceResponse> 
     Json((*state.devices).clone())
 }
 
+fn get_local_ip() -> String {
+    // Connect UDP to a public address to discover which local interface the OS would use.
+    // No packets are actually sent; this is purely for interface detection.
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| { s.connect("8.8.8.8:53")?; Ok(s) })
+        .and_then(|s| s.local_addr())
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceIpResponse {
+    ip: String,
+    port: u16,
+}
+
+async fn device_ip_handler() -> Json<DeviceIpResponse> {
+    Json(DeviceIpResponse { ip: get_local_ip(), port: PORT })
+}
+
 async fn remotestatus_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": 0 }))
 }
@@ -1673,7 +2191,7 @@ async fn events_handler(ws: WebSocketUpgrade, State(state): State<WebState>) -> 
     ws.on_upgrade(move |socket| events_socket(socket, state))
 }
 
-fn control_web_state(node_id: String, shared_token: [u8; 16], send_channels: usize, opus_bitrate_per_channel: u32, jitter: JitterConfig) -> Result<WebState> {
+fn control_web_state(node_id: String, shared_token: [u8; 16], send_channels: usize, opus_bitrate_per_channel: u32, jitter: JitterConfig, encoder_mode: EncoderMode) -> Result<WebState> {
     let send_channels = send_channels.clamp(1, MAX_CHANNELS);
     let handshake_connected = Arc::new(AtomicBool::new(false));
     let last_control_ms = Arc::new(AtomicU64::new(0));
@@ -1736,6 +2254,7 @@ fn control_web_state(node_id: String, shared_token: [u8; 16], send_channels: usi
             effective_latency_ms: jitter.target_delay_ms,
             fixed_jitter: !jitter.adaptive,
             phase_lock: jitter.phase_lock,
+            encoder_mode: encoder_mode.as_str().to_string(),
             web_note: "Web control is running. Configure a remote device and apply to start the audio/network engine.".into(),
             link_password_configured: false,
             rendezvous_url: String::new(),
@@ -1955,6 +2474,7 @@ fn spawn_web_ui(addr: String, state: WebState) {
                 .route("/api/presets/recall", post(preset_recall_handler))
                 .route("/api/stats", get(stats_handler))
                 .route("/api/remotestatus", get(remotestatus_handler))
+                .route("/api/device-ip", get(device_ip_handler))
                 .route("/api/events", get(events_handler))
                 .with_state(state);
 
@@ -1990,6 +2510,7 @@ pub fn run_bidir(
     monitor_mode: MonitorMode,
     opus_bitrate_per_channel: u32,
     rendezvous_url: Option<String>,
+    encoder_mode: EncoderMode,
 ) -> Result<()> {
     if num_channels == 0 || num_channels > MAX_CHANNELS {
         return Err(anyhow!("Channel count must be 1–{MAX_CHANNELS}"));
@@ -1999,14 +2520,78 @@ pub fn run_bidir(
     let remote_addr_str = format!("{remote_host}:{PORT}");
 
     // Initiator: connect immediately. Responder: bind only and late-connect on first valid probe.
-    let socket = Arc::new(UdpSocket::bind(format!("0.0.0.0:{PORT}"))?);
+    // Bind with retry: when the engine restarts (e.g. after Apply), the old
+    // socket may still be in TIME_WAIT for a brief window. Retry up to 10×500ms.
+    let socket = {
+        let mut last_err = None;
+        let mut sock = None;
+        for attempt in 0..10 {
+            match UdpSocket::bind(format!("0.0.0.0:{PORT}")) {
+                Ok(s) => { sock = Some(Arc::new(s)); break; }
+                Err(e) => {
+                    if attempt > 0 {
+                        tracing::warn!("Port {PORT} busy (attempt {}/10), retrying…", attempt + 1);
+                    }
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+        sock.ok_or_else(|| anyhow::anyhow!("Could not bind port {PORT}: {}", last_err.unwrap()))?
+    };
     if is_initiator {
         socket.connect(&remote_addr_str)?;
     }
 
+    // DSCP EF (Expedited Forwarding, 0xB8 = DSCP 46 << 2).
+    // Disabled by default: on unmanaged internet/mobile paths DSCP may be ignored,
+    // remarked, or policed in ways that can make loss worse. Enable explicitly
+    // with AUDIOLINK_DSCP_EF=1 when testing on a QoS-aware network.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let enable_dscp_ef = matches!(
+            std::env::var("AUDIOLINK_DSCP_EF").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        );
+        if enable_dscp_ef {
+            let tos: libc::c_int = 0xb8;
+            let rc = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_TOS,
+                    &tos as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc == 0 {
+                tracing::info!("Network QoS: DSCP EF marking enabled (IP_TOS=0xb8)");
+            } else {
+                tracing::warn!(
+                    "Network QoS: failed to enable DSCP EF: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        } else {
+            tracing::info!("Network QoS: DSCP EF marking disabled");
+        }
+    }
+
     // Tracks the established remote address in responder mode.
-    // Arc<Mutex<Option<SocketAddr>>> so keepalive and send threads can check before sending.
+    // Only ever written by the recv thread once a valid handshake arrives from the real NAT port.
     let established_addr: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
+
+    // Rendezvous-derived candidate address for pre-connection probes.
+    // Written by the rendezvous threads (registration and event listener).
+    // The keepalive thread uses this for send_to punches when not yet connected.
+    // Never used to connect() the socket — that is exclusively the recv thread's job
+    // once it has seen the real NAT source address of an inbound packet.
+    let punch_target: Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
+
+    // Bumped by non-recv threads when a reconnect/stale teardown should behave
+    // like a fresh process start for jitter/decoder/playback state.
+    let receive_reset_epoch = Arc::new(AtomicU64::new(0));
 
     let handshake_connected = Arc::new(AtomicBool::new(false));
     let last_control_ms = Arc::new(AtomicU64::new(0));
@@ -2071,6 +2656,7 @@ pub fn run_bidir(
             effective_latency_ms: jitter.target_delay_ms,
             fixed_jitter: !jitter.adaptive,
             phase_lock: jitter.phase_lock,
+            encoder_mode: encoder_mode.as_str().to_string(),
             web_note: "Setup Apply performs a controlled process rebuild so the UDP socket, Opus encoders, metadata and routing state are recreated cleanly.".into(),
             link_password_configured: load_persisted_state().config.link_password.map(|p| !p.is_empty()).unwrap_or(false),
             rendezvous_url: rendezvous_url.clone().unwrap_or_default(),
@@ -2087,44 +2673,118 @@ pub fn run_bidir(
     tracing::info!(
         "Bidir: role={}  remote_device={remote_device_name}  remote_host={}  channels={num_channels}  \
          send={send_enabled}  recv={recv_enabled}  id={node_id}  \
-         receive_buffer={}ms effective={}ms  adaptive_jitter={}  phase_lock={}",
+         receive_buffer={}ms effective={}ms  adaptive_jitter={}  phase_lock={}  encoder={}",
         if is_initiator { "initiator" } else { "responder (waiting for incoming)" },
         if is_initiator { &remote_addr_str } else { "<blank>" },
-        jitter.configured_delay_ms, jitter.target_delay_ms, jitter.adaptive, jitter.phase_lock
+        jitter.configured_delay_ms, jitter.target_delay_ms, jitter.adaptive, jitter.phase_lock,
+        encoder_mode.as_str()
     );
 
-    // M5 handshake / keepalive thread.
-    // Initiator: sends 09 07 probes every 2130ms to punch NAT and keep the connection alive.
-    // Responder: only sends keepalive once connected (no address to probe before first handshake).
-    // Both modes: sends RTT ping (09 0b) every cycle once connected.
+    // M5 handshake / keepalive / staleness-watchdog thread.
+    // Runs every 2130ms.
+    //
+    // Staleness watchdog: if connected but no valid packet for STALE_TIMEOUT_MS,
+    // the remote NAT mapping has changed (firewall test, network switch, mobile
+    // handoff). For responder/rendezvous mode: disconnect socket via AF_UNSPEC
+    // so recv_from accepts from any source again. For direct-IP initiator mode:
+    // just reset state — the socket stays connected, probes will re-handshake.
+    // In both cases the rendezvous /api/connect fires within 10s and reconnects.
     {
         let socket_hs = Arc::clone(&socket);
         let connected_hs = Arc::clone(&handshake_connected);
-        let _local_labels_hs = Arc::clone(&local_labels);
+        let established_hs = Arc::clone(&established_addr);
+        let punch_target_hs = Arc::clone(&punch_target);
+        let last_control_hs = Arc::clone(&last_control_ms);
+        let last_audio_hs = Arc::clone(&last_audio_ms);
         let rtt_hs = Arc::clone(&rtt_us10);
-        let remote_device_name_hs = remote_device_name.to_string(); // owned for 'static move closure
+        let reset_epoch_hs = Arc::clone(&receive_reset_epoch);
+        let remote_channels_hs = Arc::clone(&remote_channels);
+        let remote_device_name_hs = remote_device_name.to_string();
+        let remote_addr_watchdog = remote_addr_str.clone();
+        const STALE_TIMEOUT_MS: u64 = 15_000;
         std::thread::spawn(move || {
             let probe = build_probe_packet(&device_name_token, &shared_token);
             loop {
+                let connected = connected_hs.load(Ordering::Relaxed);
+
+                // ── Staleness watchdog ────────────────────────────────────────
+                if connected {
+                    let now = now_millis();
+                    let last_any = last_control_hs.load(Ordering::Relaxed)
+                        .max(last_audio_hs.load(Ordering::Relaxed));
+                    if last_any > 0 && now.saturating_sub(last_any) > STALE_TIMEOUT_MS {
+                        tracing::warn!(
+                            "No packet for {}ms — stale connection, resetting for re-handshake",
+                            now.saturating_sub(last_any)
+                        );
+
+                        if !is_initiator {
+                            // Responder/rendezvous: remove the kernel peer filter so
+                            // recv_from accepts packets from the new NAT address.
+                            match udp_disconnect_socket(socket_hs.as_ref()) {
+                                Ok(()) => tracing::info!(
+                                    "UDP socket disconnected with AF_UNSPEC after stale timeout"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "UDP AF_UNSPEC disconnect failed after stale timeout: {e}"
+                                ),
+                            }
+                            if let Ok(mut e) = established_hs.lock() { *e = None; }
+                        }
+                        // Initiator: socket stays connected to original remote address.
+                        // Just reset state — probes will trigger a fresh handshake.
+
+                        connected_hs.store(false, Ordering::Relaxed);
+                        last_control_hs.store(0, Ordering::Relaxed);
+                        last_audio_hs.store(0, Ordering::Relaxed);
+                        rtt_hs.store(0, Ordering::Relaxed);
+                        // NOTE: remote_channels is NOT zeroed here. reset_receive_session! in
+                        // the recv thread sets started_recv=false, which makes the output
+                        // callback output silence without touching any rings. Zeroing
+                        // remote_channels here causes a priming race: the recv thread primes
+                        // with active=1 (0 clamped), fires started_recv=true on ring[0] alone,
+                        // then metadata arrives and active jumps to N, leaving rings 1..N-1
+                        // empty — output underflows until they catch up.
+                        reset_epoch_hs.fetch_add(1, Ordering::Relaxed);
+
+                        std::thread::sleep(std::time::Duration::from_millis(2130));
+                        continue;
+                    }
+                }
+
+                // ── Probe / keepalive ─────────────────────────────────────────
                 let connected = connected_hs.load(Ordering::Relaxed);
                 if is_initiator {
                     socket_hs.send(&probe).ok();
                     if connected {
                         tracing::trace!("09 07 keepalive sent");
+                        // Zero RTT *before* sending the ping so a fast pong on a LAN
+                        // cannot be immediately overwritten by the store that follows.
+                        rtt_hs.store(0, Ordering::Relaxed);
                         let ts = now_us();
                         socket_hs.send(&build_rtt_ping(ts)).ok();
-                        rtt_hs.store(0, Ordering::Relaxed);
                     } else {
                         tracing::trace!("09 07 probe sent");
                     }
                 } else if connected {
                     socket_hs.send(&probe).ok();
+                    rtt_hs.store(0, Ordering::Relaxed);
                     let ts = now_us();
                     socket_hs.send(&build_rtt_ping(ts)).ok();
-                    rtt_hs.store(0, Ordering::Relaxed);
                     tracing::trace!("09 07 keepalive sent (responder)");
                 } else {
-                    tracing::trace!("Responder: waiting for incoming connection from {remote_device_name_hs}");
+                    let target = punch_target_hs.lock().ok().and_then(|g| *g);
+                    match target {
+                        Some(addr) => {
+                            match socket_hs.send_to(&probe, addr) {
+                                Ok(_) => tracing::trace!("09 07 rendezvous punch → {addr}"),
+                                Err(e) => tracing::warn!("09 07 rendezvous punch to {addr} failed: {e}"),
+                            }
+                        }
+                        None => {
+                            tracing::trace!("Responder: waiting for {remote_device_name_hs}");
+                        }
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2130));
             }
@@ -2144,18 +2804,98 @@ pub fn run_bidir(
         };
 
         // Registration keepalive — POST /api/register every 10 seconds.
+        // After the first successful registration, if we have a remote device name
+        // and no direct host (pure rendezvous mode), call /api/connect to notify
+        // the remote and trigger simultaneous probe firing on both sides.
         let reg_name = node_id.clone();
+        let reg_remote = remote_device_name.to_string();
         let reg_base = rdv_base.clone();
+        let reg_direct = is_initiator;
+        let reg_connected = Arc::clone(&handshake_connected);
+        let reg_socket = Arc::clone(&socket);
+        let reg_punch_target = Arc::clone(&punch_target);
+        let reg_established_addr = Arc::clone(&established_addr);
+        let reg_probe_token = device_name_token;
+        let reg_shared_token = shared_token;
         std::thread::spawn(move || {
-            let body = serde_json::json!({ "name": reg_name, "port": PORT }).to_string();
+            let reg_body = serde_json::json!({ "name": reg_name, "port": PORT }).to_string();
+            let con_body = serde_json::json!({ "my_name": reg_name, "remote_name": reg_remote }).to_string();
+            let mut cycle = 0u32;
+            std::thread::sleep(Duration::from_millis(1500));
             loop {
                 match ureq::post(&format!("{reg_base}/api/register"))
                     .set("Content-Type", "application/json")
-                    .send_string(&body)
+                    .send_string(&reg_body)
                 {
-                    Ok(_) => tracing::debug!("rendezvous: registered {reg_name}"),
+                    Ok(_) => {
+                        tracing::debug!("rendezvous: registered {reg_name}");
+                        // Call /api/connect on every 10s register cycle while not yet
+                        // handshaked. Frequent retries are desirable on mobile paths where
+                        // the remote may have re-registered with a new NAT address.
+                        if !reg_direct && !reg_remote.is_empty()
+                            && !reg_connected.load(Ordering::Relaxed)
+                        {
+                            match ureq::post(&format!("{reg_base}/api/connect"))
+                                .set("Content-Type", "application/json")
+                                .send_string(&con_body)
+                            {
+                                Ok(resp) => {
+                                    if let Ok(text) = resp.into_string() {
+                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                            let addr_str = v["remote_addr"].as_str().unwrap_or("?");
+                                            let notified = v["notified"].as_bool().unwrap_or(false);
+                                            tracing::info!(
+                                                "rendezvous: connect → {reg_remote} @ {addr_str} notified={notified}"
+                                            );
+                                            // Both sides must punch simultaneously.
+                                            // The remote was notified and will fire at us;
+                                            // we must also fire at the remote immediately
+                                            // to open our own NAT hole before their probe arrives.
+                                            if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                                                // Store as the candidate punch address.
+                                                // Do NOT call socket.connect() here — connecting to the
+                                                // rendezvous-registered port (always 20102) would set a
+                                                // kernel-level receive filter that silently drops any probe
+                                                // arriving from the remote's actual NAT-mapped port, which
+                                                // is almost certainly different. The recv thread will
+                                                // connect() once it sees the real source address.
+                                                if let Ok(mut t) = reg_punch_target.lock() {
+                                                    *t = Some(addr);
+                                                }
+                                                // If a previous connected UDP peer filter is still installed
+                                                // after ECONNREFUSED/stale teardown, send_to() may fail or be
+                                                // ignored. Ensure rendezvous punches use an unconnected socket.
+                                                if !reg_connected.load(Ordering::Relaxed) {
+                                                    if let Ok(mut e) = reg_established_addr.lock() {
+                                                        if e.is_some() {
+                                                            match udp_disconnect_socket(reg_socket.as_ref()) {
+                                                                Ok(()) => tracing::info!(
+                                                                    "UDP socket disconnected with AF_UNSPEC before rendezvous punch"
+                                                                ),
+                                                                Err(err) => tracing::warn!(
+                                                                    "UDP AF_UNSPEC disconnect before rendezvous punch failed: {err}"
+                                                                ),
+                                                            }
+                                                            *e = None;
+                                                        }
+                                                    }
+                                                }
+                                                let probe = build_probe_packet(&reg_probe_token, &reg_shared_token);
+                                                match reg_socket.send_to(&probe, addr) {
+                                                    Ok(_) => tracing::info!("rendezvous: outbound punch at {addr}"),
+                                                    Err(e) => tracing::warn!("rendezvous: outbound punch to {addr} failed: {e}"),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::warn!("rendezvous: connect request failed: {e}"),
+                            }
+                        }
+                    }
                     Err(e) => tracing::warn!("rendezvous: register failed: {e}"),
                 }
+                cycle += 1;
                 std::thread::sleep(Duration::from_secs(10));
             }
         });
@@ -2165,7 +2905,9 @@ pub fn run_bidir(
         // to begin NAT hole punching simultaneously with the remote device.
         let event_name = node_id.clone();
         let event_socket = Arc::clone(&socket);
-        let event_established = Arc::clone(&established_addr);
+        let event_punch_target = Arc::clone(&punch_target);
+        let event_established_addr = Arc::clone(&established_addr);
+        let event_connected = Arc::clone(&handshake_connected);
         let event_probe_token = device_name_token;
         let event_shared_token = shared_token;
         std::thread::spawn(move || {
@@ -2180,18 +2922,36 @@ pub fn run_bidir(
                                 if from_addr.is_empty() { continue; }
                                 tracing::info!("rendezvous: inbound connect from {from_name} @ {from_addr}");
                                 if let Ok(addr) = from_addr.parse::<std::net::SocketAddr>() {
-                                    let already = event_established.lock()
-                                        .map(|e| e.is_some()).unwrap_or(false);
-                                    if !already {
-                                        if event_socket.connect(addr).is_ok() {
-                                            if let Ok(mut e) = event_established.lock() {
-                                                *e = Some(addr);
+                                    // Same reasoning as the registration thread: do NOT connect() here.
+                                    // Store the rendezvous address as the punch target and use send_to
+                                    // so the socket stays unconnected and recv_from can accept packets
+                                    // from the remote's real NAT port.
+                                    if let Ok(mut t) = event_punch_target.lock() {
+                                        *t = Some(addr);
+                                    }
+                                    // Same as the registration path: while disconnected, make
+                                    // sure an old connected-UDP peer filter cannot block the
+                                    // new rendezvous punch/re-handshake.
+                                    if !event_connected.load(Ordering::Relaxed) {
+                                        if let Ok(mut e) = event_established_addr.lock() {
+                                            if e.is_some() {
+                                                match udp_disconnect_socket(event_socket.as_ref()) {
+                                                    Ok(()) => tracing::info!(
+                                                        "UDP socket disconnected with AF_UNSPEC before inbound-event punch"
+                                                    ),
+                                                    Err(err) => tracing::warn!(
+                                                        "UDP AF_UNSPEC disconnect before inbound-event punch failed: {err}"
+                                                    ),
+                                                }
+                                                *e = None;
                                             }
-                                            tracing::info!("rendezvous: late-connected to {addr}");
                                         }
                                     }
                                     let probe = build_probe_packet(&event_probe_token, &event_shared_token);
-                                    event_socket.send(&probe).ok();
+                                    match event_socket.send_to(&probe, addr) {
+                                        Ok(_) => tracing::info!("rendezvous: outbound punch at {addr}"),
+                                        Err(e) => tracing::warn!("rendezvous: outbound punch to {addr} failed: {e}"),
+                                    }
                                 }
                             }
                         }
@@ -2250,6 +3010,11 @@ pub fn run_bidir(
         let started = Arc::new(AtomicBool::new(false));
         let started_recv = Arc::clone(&started);
         let started_play = Arc::clone(&started);
+        // When a session resets, the output callback drains old playback samples
+        // under silence before the recv thread is allowed to prime the new stream.
+        let flush_playback_samples = Arc::new(AtomicUsize::new(0));
+        let flush_playback_samples_recv = Arc::clone(&flush_playback_samples);
+        let flush_playback_samples_play = Arc::clone(&flush_playback_samples);
         let empty_cb = Arc::new(AtomicU32::new(0));
         let empty_cb_play = Arc::clone(&empty_cb);
         let empty_cb_recv = Arc::clone(&empty_cb);
@@ -2274,6 +3039,8 @@ pub fn run_bidir(
         let rtt_us10_recv = Arc::clone(&rtt_us10);
         let remote_conflict_recv = Arc::clone(&remote_conflict);
         let established_addr_recv = Arc::clone(&established_addr);
+        let punch_target_recv = Arc::clone(&punch_target);
+        let receive_reset_epoch_recv = Arc::clone(&receive_reset_epoch);
         let ring_overflows = Arc::new(AtomicUsize::new(0));
         let ring_overflows_recv = Arc::clone(&ring_overflows);
 
@@ -2287,7 +3054,9 @@ pub fn run_bidir(
         // lower-latency independent-channel behaviour.
         std::thread::spawn(move || {
             unsafe {
-                let param = libc::sched_param { sched_priority: 20 };
+                let mut param: libc::sched_param = std::mem::zeroed();
+                param.sched_priority = 20;
+        
                 let ret = libc::pthread_setschedparam(
                     libc::pthread_self(), libc::SCHED_FIFO, &param
                 );
@@ -2308,24 +3077,14 @@ pub fn run_bidir(
                 .set_read_timeout(Some(Duration::from_millis(1)))
                 .ok();
 
-            let mut decoders: Vec<opus::Decoder> = (0..MAX_CHANNELS)
-                .map(|_| opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap())
-                .collect();
+            let mut decoders = fresh_opus_decoders();
 
             // One Rubato FastFixedIn resampler per channel.
             // Ratio 1.0 at init; updated each loop iteration from correction_ratio.
             // PolynomialDegree::Linear gives transparent interpolation at sub-500ppm
             // rates with negligible CPU cost. The max_relative of 1.01 covers our
             // ±5000ppm control clamp with headroom.
-            let mut resamplers: Vec<FastFixedIn<f32>> = (0..MAX_CHANNELS)
-                .map(|_| FastFixedIn::new(
-                    1.0,
-                    1.01,
-                    PolynomialDegree::Linear,
-                    FRAME_SAMPLES,
-                    1,
-                ).expect("Rubato resampler init failed"))
-                .collect();
+            let mut resamplers = fresh_asrc_resamplers();
 
             let mut buf = vec![0u8; 65535];
             let mut pcm = vec![0f32; FRAME_SAMPLES];
@@ -2346,15 +3105,104 @@ pub fn run_bidir(
             let mut last_jitter_timestamp: Option<u32> = None;
             let mut last_jitter_arrival: Option<Instant> = None;
             let mut jitter_ms_estimate: f64 = 0.0;
+            // Rolling window of raw inter-arrival jitter deltas for p95 computation.
+            // 300 samples ≈ 60s at 50fps. Sorted at the 5s stats interval — cost is trivial.
+            // Kept separate from the EMA because the EMA aggressively smooths bursts that
+            // a real buffer needs to absorb.
+            const JITTER_WINDOW_SIZE: usize = 300;
+            let mut jitter_window: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(JITTER_WINDOW_SIZE + 1);
             let mut output_underflows_at_last_stats: usize = 0;
             let mut plc_count_at_last_stats: usize = 0;
             let mut lost_packets_at_last_stats: usize = 0;
+            let mut ring_overflows_at_last_stats: usize = 0;
+            // Non-phase-lock decoded_fps tracking: count one group per unique RTP timestamp.
+            let mut last_decoded_ts_nonpl: Option<u32> = None;
             let mut correction_ratio: f64 = 1.0; // updated each iteration; 1.0 on first drain is correct
+            // PI controller state. Integral sampled at 5Hz (every 200ms) using actual elapsed
+            // time — independent of recv loop rate. Eliminates steady-state fill error from a
+            // constant clock offset (P-only equilibrium: fill = target + offset_ppm / K_p).
+            let mut integral_correction: f64 = 0.0;
+            let mut integral_last = std::time::Instant::now();
+            // Overflow cooldown — log and reset integral at most once per 10 seconds.
+            let mut overflow_last_warn = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(30))
+                .unwrap_or_else(std::time::Instant::now);
+            // High-watermark for phase-lock drain — discard late packets for timestamps
+            // that have already been PLC-processed to prevent double-decode (decoded_fps > 50).
+            let mut last_drained_ts: Option<u32> = None;
+            let mut observed_reset_epoch = receive_reset_epoch_recv.load(Ordering::Relaxed);
             if jitter.phase_lock {
                 tracing::info!("M6 jitter: phase-locked timestamp buffer active; Rubato ASRC active");
             }
 
+            macro_rules! reset_receive_session {
+                ($reason:expr, $clear_metadata:expr) => {{
+                    let active_for_flush = remote_channels_recv.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
+                    let old_fill_samples = pb_prods[..active_for_flush]
+                        .iter()
+                        .map(|p| p.occupied_len())
+                        .max()
+                        .unwrap_or(0);
+
+                    groups.clear();
+                    newest_timestamp = None;
+                    last_drained_ts = None;
+                    last_seq.fill(None);
+                    last_jitter_timestamp = None;
+                    last_jitter_arrival = None;
+                    jitter_ms_estimate = 0.0;
+                    jitter_window.clear();
+                    last_decoded_ts_nonpl = None;
+                    integral_correction = 0.0;
+                    correction_ratio = 1.0;
+                    integral_last = std::time::Instant::now();
+                    decoders = fresh_opus_decoders();
+                    resamplers = fresh_asrc_resamplers();
+
+                    media_packets_total = 0;
+                    media_packets_at_last_stats = 0;
+                    rx_bytes_total = 0;
+                    rx_bytes_at_last_stats = 0;
+                    lost_packets_total = 0;
+                    lost_packets_at_last_stats = 0;
+                    plc_count_total = 0;
+                    plc_count_at_last_stats = 0;
+                    decoded_groups_total = 0;
+                    decoded_groups_at_last_stats = 0;
+                    output_underflows_at_last_stats = output_underflows_recv.load(Ordering::Relaxed);
+                    last_stats = Instant::now();
+
+                    if $clear_metadata {
+                        last_remote_metadata = None;
+                    }
+
+                    started_recv.store(false, Ordering::Relaxed);
+                    empty_cb_recv.store(0, Ordering::Relaxed);
+
+                    if old_fill_samples > 0 {
+                        // Drain stale samples under silence before accepting new media.
+                        // This makes a reconnect start from an empty playback ring, like
+                        // a cold process start, instead of priming on old-session audio.
+                        flush_playback_samples_recv.store(
+                            old_fill_samples.saturating_add(FRAME_SAMPLES),
+                            Ordering::Relaxed,
+                        );
+                    }
+
+                    tracing::info!(
+                        "Receive session reset ({}) — flushing {}ms of old playback state",
+                        $reason,
+                        old_fill_samples * 1000 / SAMPLE_RATE as usize
+                    );
+                }};
+            }
+
             loop {
+                let reset_epoch_now = receive_reset_epoch_recv.load(Ordering::Relaxed);
+                if reset_epoch_now != observed_reset_epoch {
+                    observed_reset_epoch = reset_epoch_now;
+                    reset_receive_session!("watchdog/socket reset", true);
+                }
                 // In responder mode we use recv_from so we can extract the sender's address
                 // for the late-connect. In initiator mode we use recv (socket is already connected).
                 let recv_result = if is_initiator {
@@ -2365,22 +3213,15 @@ pub fn run_bidir(
 
                 match recv_result {
                     Ok((n, src_addr_opt)) => {
-                        // Responder: late-connect on first valid handshake or media packet.
+                        // Responder: reject packets from a different source once established,
+                        // but do not late-connect yet. The first packet may be stray UDP or a
+                        // stale/mismatched handshake; connecting here would install the kernel
+                        // peer filter too early and silently drop the real NAT-mapped peer.
                         if !is_initiator {
                             if let Some(src_addr) = src_addr_opt {
-                                let mut established = established_addr_recv.lock().unwrap();
-                                match *established {
-                                    None => {
-                                        // First packet from any source — connect to it.
-                                        if let Err(e) = socket_recv.connect(src_addr) {
-                                            tracing::error!("Responder: late-connect to {src_addr} failed: {e}");
-                                        } else {
-                                            tracing::info!("Responder: late-connected to {src_addr}");
-                                            *established = Some(src_addr);
-                                        }
-                                    }
-                                    Some(known) if known != src_addr => {
-                                        // Packet from a different address while already connected — conflict.
+                                let established = established_addr_recv.lock().ok().and_then(|g| *g);
+                                if let Some(known) = established {
+                                    if known != src_addr {
                                         tracing::warn!(
                                             "Connection conflict: packet from {src_addr} but already connected to {known}"
                                         );
@@ -2391,15 +3232,63 @@ pub fn run_bidir(
                                         }
                                         continue; // reject this packet
                                     }
-                                    _ => {}
                                 }
                             }
                         }
 
+                        let responder_late_connect = |src_addr_opt: Option<std::net::SocketAddr>| -> bool {
+                            if is_initiator {
+                                return true;
+                            }
+                            let Some(src_addr) = src_addr_opt else {
+                                tracing::warn!("Responder: validated handshake had no source address");
+                                return false;
+                            };
+
+                            let mut established = match established_addr_recv.lock() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    tracing::error!("Responder: established_addr lock poisoned");
+                                    return false;
+                                }
+                            };
+
+                            match *established {
+                                Some(known) if known == src_addr => true,
+                                Some(known) => {
+                                    tracing::warn!(
+                                        "Connection conflict: validated packet from {src_addr} but already connected to {known}"
+                                    );
+                                    if let Ok(mut c) = remote_conflict_recv.lock() {
+                                        if c.is_none() {
+                                            *c = Some(src_addr.to_string());
+                                        }
+                                    }
+                                    false
+                                }
+                                None => {
+                                    // First *valid* handshake from the peer. This is the real
+                                    // NAT-translated source address, which may differ from the
+                                    // rendezvous-registered port. Connect only after token validation
+                                    // so the kernel peer filter cannot latch onto stray/stale UDP.
+                                    if let Err(e) = socket_recv.connect(src_addr) {
+                                        tracing::error!("Responder: late-connect to {src_addr} failed: {e}");
+                                        false
+                                    } else {
+                                        tracing::info!("Responder: late-connected to {src_addr}");
+                                        *established = Some(src_addr);
+                                        if let Ok(mut t) = punch_target_recv.lock() { *t = None; }
+                                        true
+                                    }
+                                }
+                            }
+                        };
+
                         if let Some(pkt) = parse_handshake_packet(&buf[..n]) {
-                            last_control_recv.store(now_millis(), Ordering::Relaxed);
                             match pkt {
                                 HandshakePacket::Probe { sender_token, expected_peer } if expected_peer == shared_token => {
+                                    if !responder_late_connect(src_addr_opt) { continue; }
+                                    last_control_recv.store(now_millis(), Ordering::Relaxed);
                                     // If we now know the sender's device name from metadata, use it for conflict reporting.
                                     // For now store sender_token hex as the conflict identifier.
                                     let sender_name = last_remote_metadata.as_ref()
@@ -2416,6 +3305,7 @@ pub fn run_bidir(
                                     ))
                                         .ok();
                                     if !connected_recv.swap(true, Ordering::Relaxed) {
+                                        reset_receive_session!("new authenticated handshake", true);
                                         tracing::info!(
                                             "Handshake: received 09 07 from {sender_name}, sent 09 09 / 09 08 / 09 0a"
                                         );
@@ -2424,6 +3314,8 @@ pub fn run_bidir(
                                     }
                                 }
                                 HandshakePacket::Accept { token } if token == shared_token => {
+                                    if !responder_late_connect(src_addr_opt) { continue; }
+                                    last_control_recv.store(now_millis(), Ordering::Relaxed);
                                     socket_recv.send(&build_confirm_packet(&shared_token)).ok();
                                     socket_recv
                                         .send(&build_metadata_packet_with_labels(
@@ -2434,17 +3326,23 @@ pub fn run_bidir(
                                     ))
                                         .ok();
                                     if !connected_recv.swap(true, Ordering::Relaxed) {
+                                        reset_receive_session!("new authenticated handshake", true);
                                         tracing::info!("Handshake: received 09 09, sent 09 08 / 09 0a");
                                         if let Ok(mut c) = remote_conflict_recv.lock() { *c = None; }
                                     }
                                 }
                                 HandshakePacket::Confirm { token } if token == shared_token => {
+                                    if !responder_late_connect(src_addr_opt) { continue; }
+                                    last_control_recv.store(now_millis(), Ordering::Relaxed);
                                     if !connected_recv.swap(true, Ordering::Relaxed) {
+                                        reset_receive_session!("new authenticated handshake", true);
                                         tracing::info!("Handshake: received 09 08 confirmation");
                                         if let Ok(mut c) = remote_conflict_recv.lock() { *c = None; }
                                     }
                                 }
                                 HandshakePacket::Metadata(metadata) if metadata.channels > 0 => {
+                                    if !connected_recv.load(Ordering::Relaxed) { continue; }
+                                    last_control_recv.store(now_millis(), Ordering::Relaxed);
                                     let mut metadata = metadata;
                                     metadata.channels = metadata.channels.min(MAX_CHANNELS);
 
@@ -2464,8 +3362,7 @@ pub fn run_bidir(
 
                                     remote_channels_recv.store(metadata.channels, Ordering::Relaxed);
                                     if channels_changed {
-                                        groups.clear();
-                                        started_recv.store(false, Ordering::Relaxed);
+                                        reset_receive_session!("remote channel layout changed", false);
                                     }
 
                                     tracing::info!(
@@ -2480,10 +3377,14 @@ pub fn run_bidir(
                                     last_remote_metadata = Some(metadata);
                                 }
                                 HandshakePacket::RttPing { timestamp_us } => {
+                                    if !connected_recv.load(Ordering::Relaxed) { continue; }
+                                    last_control_recv.store(now_millis(), Ordering::Relaxed);
                                     // Echo back immediately — do not alter the timestamp.
                                     socket_recv.send(&build_rtt_pong(timestamp_us)).ok();
                                 }
                                 HandshakePacket::RttPong { timestamp_us } => {
+                                    if !connected_recv.load(Ordering::Relaxed) { continue; }
+                                    last_control_recv.store(now_millis(), Ordering::Relaxed);
                                     let now = now_us();
                                     if now >= timestamp_us {
                                         let rtt_us = now - timestamp_us;
@@ -2497,6 +3398,12 @@ pub fn run_bidir(
                             continue;
                         }
 
+                        if !is_initiator && !connected_recv.load(Ordering::Relaxed) {
+                            // Media packets are not token-authenticated, so they must not be
+                            // allowed to establish the responder socket before the handshake.
+                            continue;
+                        }
+
                         let pkt = match parse_packet(&buf[..n]) {
                             Some(p) => {
                                 last_audio_recv.store(now_millis(), Ordering::Relaxed);
@@ -2504,6 +3411,12 @@ pub fn run_bidir(
                             },
                             None => continue,
                         };
+
+                        if flush_playback_samples_recv.load(Ordering::Relaxed) > 0 {
+                            // We are still draining stale audio from the previous session.
+                            // Drop media rather than mixing old and new sessions in the ring.
+                            continue;
+                        }
 
                         media_packets_total = media_packets_total.saturating_add(1);
                         rx_bytes_total = rx_bytes_total.saturating_add(n);
@@ -2515,6 +3428,11 @@ pub fn run_bidir(
                                     let arrival_ms = arrival.duration_since(prev_arrival).as_secs_f64() * 1000.0;
                                     let delta = (arrival_ms - expected_ms).abs();
                                     jitter_ms_estimate += (delta - jitter_ms_estimate) / 16.0;
+                                    // P95 window: cap at JITTER_WINDOW_SIZE samples.
+                                    if jitter_window.len() >= JITTER_WINDOW_SIZE {
+                                        jitter_window.pop_front();
+                                    }
+                                    jitter_window.push_back(delta);
                                 }
                             }
                             last_jitter_timestamp = Some(pkt.timestamp);
@@ -2527,6 +3445,28 @@ pub fn run_bidir(
                                 "Received ch{ch} exceeds MAX_CHANNELS ({MAX_CHANNELS}) — ignoring"
                             );
                             continue;
+                        }
+
+                        if jitter.phase_lock {
+                            if let Some(hwm) = last_drained_ts {
+                                let rollback = hwm.wrapping_sub(pkt.timestamp);
+                                let at_or_behind_hwm = rtp_timestamp_at_or_before(pkt.timestamp, hwm);
+                                let seq_reset = last_seq[ch]
+                                    .map(|prev| rtp_seq_looks_reset(prev, pkt.seq))
+                                    .unwrap_or(false);
+                                let fresh_sender_ts = pkt.timestamp <= RTP_RESTART_LOW_TS_SAMPLES;
+
+                                if at_or_behind_hwm
+                                    && rollback > RTP_RESTART_ROLLBACK_SAMPLES
+                                    && (seq_reset || fresh_sender_ts)
+                                {
+                                    tracing::warn!(
+                                        "RTP stream restart detected on ch{ch}: ts={} is {} samples behind drained ts {}, seq={}; resetting receive jitter state",
+                                        pkt.timestamp, rollback, hwm, pkt.seq
+                                    );
+                                    reset_receive_session!("RTP timestamp/sequence restart", false);
+                                }
+                            }
                         }
 
                         if let Some(prev) = last_seq[ch] {
@@ -2554,11 +3494,28 @@ pub fn run_bidir(
                         });
 
                         if jitter.phase_lock {
+                            // Discard packets whose timestamp has already been processed
+                            // (PLC was generated after phase-lock timeout). Without this,
+                            // the late real packet would create a new BTreeMap entry for
+                            // the same timestamp, get decoded again, and push fill above
+                            // the real-time rate — decoded_fps exceeds 50 and fill drifts up.
+                            if let Some(hwm) = last_drained_ts {
+                                if rtp_timestamp_at_or_before(pkt.timestamp, hwm) {
+                                    continue;
+                                }
+                            }
                             let group = groups
                                 .entry(pkt.timestamp)
                                 .or_insert_with(|| FrameGroup::new(pkt.timestamp, active));
                             group.insert(ch, pkt.opus_payload);
                         } else {
+                            // Non-phase-lock: decode immediately per channel.
+                            // Count one decoded group per unique RTP timestamp so decoded_fps
+                            // matches the phase-lock path (one entry per 20ms frame, not per channel).
+                            if last_decoded_ts_nonpl != Some(pkt.timestamp) {
+                                decoded_groups_total += 1;
+                                last_decoded_ts_nonpl = Some(pkt.timestamp);
+                            }
                             let was_real = decode_or_plc(
                                 &mut decoders[ch],
                                 Some(pkt.opus_payload),
@@ -2601,10 +3558,32 @@ pub fn run_bidir(
                         // Unlike WouldBlock, ECONNREFUSED bypasses the recv timeout and
                         // returns immediately, so we must sleep here or we spin at 100%
                         // CPU and starve the audio callback. Mark disconnected so the
-                        // keepalive thread resumes probing, then sleep 100ms per retry.
+                        // keepalive/rendezvous paths resume probing, and in responder mode
+                        // remove the connected-UDP peer filter so a new NAT port can reach us.
                         if connected_recv.swap(false, Ordering::Relaxed) {
                             tracing::info!("recv: remote disconnected (ECONNREFUSED) — waiting for reconnect");
                         }
+                        if !is_initiator {
+                            match udp_disconnect_socket(socket_recv.as_ref()) {
+                                Ok(()) => tracing::info!(
+                                    "UDP socket disconnected with AF_UNSPEC after ECONNREFUSED"
+                                ),
+                                Err(err) => tracing::warn!(
+                                    "UDP AF_UNSPEC disconnect after ECONNREFUSED failed: {err}"
+                                ),
+                            }
+                            if let Ok(mut e) = established_addr_recv.lock() { *e = None; }
+                        }
+                        // Only do the full session reset (decoder flush, ring drain, re-prime)
+                        // if playback was actually running. If nothing was playing there is no
+                        // state to flush and firing reset_receive_session! every 100ms produces
+                        // noisy "flushing 0ms" log spam with no benefit.
+                        if started_recv.load(Ordering::Relaxed) {
+                            reset_receive_session!("ECONNREFUSED", true);
+                        }
+                        last_control_recv.store(0, Ordering::Relaxed);
+                        last_audio_recv.store(0, Ordering::Relaxed);
+                        rtt_us10_recv.store(0, Ordering::Relaxed);
                         std::thread::sleep(Duration::from_millis(100));
                     }
                     Err(e) => {
@@ -2616,7 +3595,7 @@ pub fn run_bidir(
                 let active = remote_channels_recv.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
 
                 if jitter.phase_lock {
-                    let (out, plc) = drain_phase_locked_groups(
+                    let (out, plc, drained_ts) = drain_phase_locked_groups(
                         &mut groups,
                         &mut decoders,
                         active,
@@ -2650,20 +3629,52 @@ pub fn run_bidir(
                     );
                     decoded_groups_total += out;
                     plc_count_total += plc;
+                    if let Some(ts) = drained_ts { last_drained_ts = Some(ts); }
                 }
 
                 let fill_ms = ring_fill_ms(&pb_prods, active);
                 let target_fill_ms = jitter.target_delay_ms;
 
-                // M6 baseline: phase-lock and PLC are active, but clock-drift correction
-                // is not yet applied to audio. Report drift pressure only. Target latency
-                // stays fixed; timestamp groups are only held for packet alignment/timeout.
                 let fill_error_ms = fill_ms as f64 - target_fill_ms as f64;
+
+                // PI controller for ASRC clock-drift correction.
+                // P term responds immediately. I term accumulates every 200ms and eliminates
+                // steady-state fill error from constant clock offset between sender/receiver.
+                // Anti-windup clamped at ±12000ppm.
+                if jitter.adaptive {
+                    let elapsed_s = integral_last.elapsed().as_secs_f64();
+                    if elapsed_s >= 0.2 {
+                        integral_correction += fill_error_ms * 0.000003 * elapsed_s;
+                        integral_correction = integral_correction.clamp(-0.012, 0.012);
+                        integral_last = std::time::Instant::now();
+                    }
+                } else {
+                    integral_correction = 0.0;
+                    integral_last = std::time::Instant::now();
+                }
+
                 correction_ratio = if jitter.adaptive {
-                    (1.0 - fill_error_ms * 0.0000025).clamp(0.995, 1.005)
+                    (1.0 - fill_error_ms * 0.000010 - integral_correction).clamp(0.980, 1.020)
                 } else {
                     1.0
                 };
+
+                // Overflow backstop at 3× target. IMPORTANT: do NOT use started_recv here.
+                // For underruns, started=false → silence → ring refills naturally.
+                // For overflow, silence → ring never drains → immediate re-prime loop.
+                // Instead: keep audio playing (ring drains at hardware rate), reset integral,
+                // log at most once per 10 seconds.
+                if fill_ms > jitter.target_delay_ms as usize * 3 {
+                    if overflow_last_warn.elapsed() > std::time::Duration::from_secs(10) {
+                        tracing::warn!(
+                            "Buffer high: fill={}ms > 3× target ({}ms) — resetting integral",
+                            fill_ms, jitter.target_delay_ms
+                        );
+                        integral_correction = 0.0;
+                        integral_last = std::time::Instant::now();
+                        overflow_last_warn = std::time::Instant::now();
+                    }
+                }
 
                 if !started_recv.load(Ordering::Relaxed)
                     && pb_prods[..active]
@@ -2699,14 +3710,36 @@ pub fn run_bidir(
                     let rtt_raw = rtt_us10_recv.load(Ordering::Relaxed);
                     let rtt_ms = rtt_raw as f64 / 10.0;
                     let one_way_ms = rtt_ms / 2.0;
-                    let overflows = ring_overflows_recv.load(Ordering::Relaxed);
+                    let overflows_now = ring_overflows_recv.load(Ordering::Relaxed);
+                    let overflows_delta = overflows_now.saturating_sub(ring_overflows_at_last_stats);
+                    ring_overflows_at_last_stats = overflows_now;
+
+                    // P95 jitter over the rolling window. Need ≥10 samples for a
+                    // meaningful percentile; fall back to EMA until then.
+                    let jitter_p95_ms = if jitter_window.len() >= 10 {
+                        let mut sorted: Vec<f64> = jitter_window.iter().copied().collect();
+                        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let idx = ((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1);
+                        sorted[idx]
+                    } else {
+                        jitter_ms_estimate
+                    };
+                    // Rule-of-thumb: 4× p95 absorbs the vast majority of bursts.
+                    // Floor is 80ms — empirically 40ms is insufficient on WiFi paths even
+                    // when p95 looks low, because WiFi has a heavy tail (power-save wakeups,
+                    // channel scans) that doesn't appear in p95 of a 300-sample window.
+                    let recommended_buffer_ms = ((jitter_p95_ms * 4.0).ceil() as u32)
+                        .clamp(80, 500);
+
                     tracing::info!(
-                        "RX stats: channels={active} rx={:.3}Mbps loss={:.3}% jitter={:.2}ms fill={}ms target={}ms \
+                        "RX stats: channels={active} rx={:.3}Mbps loss={:.3}% jitter_ema={:.2}ms jitter_p95={:.2}ms \
+                         fill={}ms target={}ms recommend={}ms \
                          phase_lock={} queued_groups={} decoded_fps={:.1} output_underflows={} plc_channels={} \
                          seq_missing={} drift_pressure={}ppm rtt={:.1}ms one_way={:.1}ms ring_overflows={}",
-                        rx_mbps, loss_percent, jitter_ms_estimate, fill_ms, target_fill_ms,
+                        rx_mbps, loss_percent, jitter_ms_estimate, jitter_p95_ms,
+                        fill_ms, target_fill_ms, recommended_buffer_ms,
                         jitter.phase_lock, groups.len(), rx_fps, output_underflows_delta,
-                        plc_delta, seq_missing_delta, ppm, rtt_ms, one_way_ms, overflows
+                        plc_delta, seq_missing_delta, ppm, rtt_ms, one_way_ms, overflows_delta
                     );
                     if let Ok(mut stats) = ui_stats_recv.lock() {
                         stats.channels = active;
@@ -2720,12 +3753,14 @@ pub fn run_bidir(
                         stats.seq_missing = seq_missing_delta;
                         stats.loss_percent = loss_percent;
                         stats.jitter_ms = jitter_ms_estimate;
+                        stats.jitter_p95_ms = jitter_p95_ms;
+                        stats.recommended_buffer_ms = recommended_buffer_ms;
                         stats.latency_ms = fill_ms;
                         stats.rx_mbps = rx_mbps;
                         stats.drift_pressure_ppm = ppm;
                         stats.rtt_ms = rtt_ms;
                         stats.one_way_latency_ms = one_way_ms;
-                        stats.ring_overflows = overflows;
+                        stats.ring_overflows = overflows_delta;
                         stats.rx_peak_dbfs = meters_recv.snapshot_rx(active);
                         stats.monitor_peak_dbfs = meters_recv.snapshot_monitor();
                     }
@@ -2741,12 +3776,29 @@ pub fn run_bidir(
         let stream = out_device.build_output_stream(
             &out_config,
             move |data: &mut [f32], _| {
+                let active_channels = remote_channels_play.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
+
                 if !connected_play.load(Ordering::Relaxed) || !started_play.load(Ordering::Relaxed) {
+                    let mut remaining_flush = flush_playback_samples_play.load(Ordering::Relaxed);
+                    if remaining_flush > 0 {
+                        for frame in data.chunks_exact_mut(2) {
+                            for ch in 0..active_channels {
+                                let _ = pb_conss[ch].try_pop();
+                            }
+                            frame[0] = 0.0;
+                            frame[1] = 0.0;
+                            remaining_flush = remaining_flush.saturating_sub(1);
+                            if remaining_flush == 0 {
+                                // Keep output silent for the rest of this callback, but stop
+                                // draining so the recv thread can build a fresh prime buffer.
+                                break;
+                            }
+                        }
+                        flush_playback_samples_play.store(remaining_flush, Ordering::Relaxed);
+                    }
                     data.fill(0.0);
                     return;
                 }
-
-                let active_channels = remote_channels_play.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
                 let active_for_gain = meters_play.snapshot_rx(active_channels);
                 let mode = MonitorMode::from_u8(monitor_mode_play.load(Ordering::Relaxed));
                 let left_mask = output_route_masks_play[0].load(Ordering::Relaxed);
@@ -2927,7 +3979,13 @@ pub fn run_bidir(
         let input_rings_send = Arc::clone(&input_rings);
         std::thread::spawn(move || {
             let mut encoders: Vec<opus::Encoder> =
-                (0..num_channels).map(|_| make_encoder_with_bitrate(opus_bitrate_per_channel).unwrap()).collect();
+                (0..num_channels).map(|_| make_encoder_for_mode(opus_bitrate_per_channel, encoder_mode).unwrap()).collect();
+            tracing::info!(
+                "Send thread: {num_channels} Opus encoder(s) initialised — mode={} bitrate={}kb/s{}",
+                encoder_mode.as_str(),
+                opus_bitrate_per_channel / 1000,
+                if matches!(encoder_mode, EncoderMode::Speech) { " (inband FEC on)" } else { "" },
+            );
             let mut seqs = vec![0u16; num_channels];
             let mut ts: u32 = 0;
             let mut frame_count: u64 = 0;
@@ -3139,7 +4197,9 @@ fn run_receiver() -> Result<()> {
 
     std::thread::spawn(move || {
         unsafe {
-            let param = libc::sched_param { sched_priority: 20 };
+            let mut param: libc::sched_param = std::mem::zeroed();
+            param.sched_priority = 20;
+    
             libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param);
         }
         let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap();
@@ -3404,6 +4464,13 @@ fn main() -> Result<()> {
                 idx.and_then(|i| args.get(i + 1)).cloned()
             };
 
+            let encoder_mode = {
+                let idx = args.iter().position(|a| a == "--encoder-mode");
+                idx.and_then(|i| args.get(i + 1))
+                    .map(|s| EncoderMode::parse(s))
+                    .unwrap_or_default()
+            };
+
             run_bidir(
                 remote_host,
                 &remote_device_name,
@@ -3419,6 +4486,7 @@ fn main() -> Result<()> {
                 monitor_mode,
                 opus_bitrate_per_channel,
                 rendezvous_url,
+                encoder_mode,
             )
         }
 
@@ -3434,8 +4502,11 @@ fn main() -> Result<()> {
 
         Some("help") | Some("--help") | Some("-h") => {
             eprintln!("Usage:");
-            eprintln!("  audiolinkd [--web ADDR:PORT] [--id NAME] [--token TOKEN] [--channels N] [--bitrate BPS] [--latency-ms MS]");
-            eprintln!("  audiolinkd bidir <REMOTE_IP> [--channels N] [--token TOKEN] [--id NAME] [--bitrate BPS] [--latency-ms MS] [--latency-ms N] [--fixed-jitter] [--no-phase-lock] [--web ADDR:PORT] [--no-web]");
+            eprintln!("  audiolinkd [--web ADDR:PORT] [--id NAME] [--token TOKEN] [--channels N] [--bitrate BPS] [--latency-ms MS] [--encoder-mode music|speech]");
+            eprintln!("  audiolinkd bidir <REMOTE_IP> [--channels N] [--token TOKEN] [--id NAME] [--bitrate BPS] [--latency-ms MS] [--fixed-jitter] [--no-phase-lock] [--encoder-mode music|speech] [--web ADDR:PORT] [--no-web]");
+            eprintln!();
+            eprintln!("  --encoder-mode music   Opus Application::Audio, no FEC (default, best for programme)");
+            eprintln!("  --encoder-mode speech  Opus Application::Voip, inband FEC on (halves perceived loss on mobile)");
             eprintln!();
             eprintln!("Default mode starts the Web UI first. Configure the remote device in Setup.");
             Ok(())
@@ -3503,6 +4574,13 @@ fn main() -> Result<()> {
                     .filter(|u| !u.trim().is_empty())
             };
 
+            let encoder_mode = {
+                let idx = args.iter().position(|a| a == "--encoder-mode");
+                idx.and_then(|i| args.get(i + 1))
+                    .map(|s| EncoderMode::parse(s))
+                    .unwrap_or_else(|| persisted.encoder_mode.unwrap_or_default())
+            };
+
             if let Some(remote_host) = remote_host.filter(|r| !r.trim().is_empty()) {
                 tracing::info!("AudioLink loading persistent config: remote_host={remote_host} remote_device={remote_device_name}");
                 run_bidir(
@@ -3520,6 +4598,7 @@ fn main() -> Result<()> {
                     MonitorMode::PatchMatrix,
                     opus_bitrate_per_channel,
                     rendezvous_url,
+                    encoder_mode,
                 )
             } else if !remote_device_name.is_empty() {
                 tracing::info!("AudioLink starting in responder mode: waiting for {remote_device_name}");
@@ -3538,9 +4617,10 @@ fn main() -> Result<()> {
                     MonitorMode::PatchMatrix,
                     opus_bitrate_per_channel,
                     rendezvous_url,
+                    encoder_mode,
                 )
             } else {
-                let state = control_web_state(node_id.clone(), shared_token, num_channels, opus_bitrate_per_channel, jitter)?;
+                let state = control_web_state(node_id.clone(), shared_token, num_channels, opus_bitrate_per_channel, jitter, encoder_mode)?;
                 tracing::info!("AudioLink Web UI starting — open http://{web_addr} and use Setup to connect");
                 spawn_web_ui(web_addr, state);
                 loop { std::thread::sleep(Duration::from_secs(3600)); }
