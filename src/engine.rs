@@ -191,6 +191,9 @@ pub fn run_bidir(
         remote_conflict: Arc::clone(&remote_conflict),
     };
 
+    // Extract Arc refs before web_state is moved into spawn_web_ui
+    let actual_input_rate  = Arc::clone(&web_state.actual_input_rate);
+    let actual_output_rate = Arc::clone(&web_state.actual_output_rate);
     if let Some(addr) = web_addr { spawn_web_ui(addr, web_state); }
 
     tracing::info!(
@@ -423,8 +426,7 @@ pub fn run_bidir(
             out_device.name().unwrap_or_default(),
             out_device_rate,
             if out_device_rate != SAMPLE_RATE { " (resampling from 48kHz)" } else { "" });
-        // Expose actual negotiated rate to the web UI
-        web_state.actual_output_rate.store(out_device_rate, Ordering::Relaxed);
+        actual_output_rate.store(out_device_rate, Ordering::Relaxed);
 
         let prime_samples = ((jitter.target_delay_ms as usize * SAMPLE_RATE as usize) / 1000)
             .max(PRIME_SAMPLES);
@@ -935,7 +937,7 @@ pub fn run_bidir(
         let mut out_carry: Vec<f32> = Vec::with_capacity(out_carry_capacity);
         let mut out_staging_l = vec![0.0f32; out_resample_chunk];
         let mut out_staging_r = vec![0.0f32; out_resample_chunk];
-        let mut out_staging_pos = 0usize; // how many 48kHz frames we've written to staging
+        let _out_staging_pos = 0usize; // how many 48kHz frames we've written to staging
         let mut limiter = Limiter::new();
         let stream = out_device.build_output_stream(
             &out_config,
@@ -1106,8 +1108,7 @@ pub fn run_bidir(
                     tracing::info!("Input: {} @ {}Hz {}ch{}",
                         in_dev.name()?, in_device_rate, actual_in_channels,
                         if in_device_rate != SAMPLE_RATE { " (resampling to 48kHz)" } else { "" });
-                    // Expose actual negotiated rate to the web UI
-                    web_state.actual_input_rate.store(in_device_rate, Ordering::Relaxed);
+                    actual_input_rate.store(in_device_rate, Ordering::Relaxed);
                     // Build a resampler if the device doesn't run at 48kHz
                     let mut in_resampler = make_io_resampler(in_device_rate, SAMPLE_RATE);
                     let rings_cb  = Arc::clone(&input_rings);
