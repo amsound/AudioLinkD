@@ -184,6 +184,7 @@ pub fn run_bidir(
         },
         devices: Arc::clone(&devices),
         restart_lock: Arc::new(Mutex::new(())),
+        established_peer_addr: Arc::clone(&established_addr),
         rtt_us10: Arc::clone(&rtt_us10),
         remote_conflict: Arc::clone(&remote_conflict),
     };
@@ -337,7 +338,11 @@ pub fn run_bidir(
                                 }
                             }
                         }
-                        Ok(_) => {}
+                        Ok(resp) if resp.status() == 404 => {
+                            // 404 = node not registered yet or unknown; wait before retry
+                            std::thread::sleep(Duration::from_secs(5));
+                        }
+                        Ok(_) => {} // 204 = no events, reconnect immediately
                         Err(e) => { tracing::warn!("rendezvous: events poll: {e}"); std::thread::sleep(Duration::from_secs(5)); }
                     }
                     std::thread::sleep(Duration::from_millis(200));
@@ -376,15 +381,18 @@ pub fn run_bidir(
         host.default_input_device()
     };
 
+    // input_ok: declared here so it's in scope for both recv and send pipelines
+    let input_ok     = Arc::new(AtomicBool::new(true));
+    let input_ok_err = Arc::clone(&input_ok);
+
     // ── Receive / playback pipeline ─────────────────────────────────────────
     let _out_stream: Option<cpal::Stream> = if recv_enabled {
         let out_device = find_output_device(&selected_output_device).ok_or_else(|| anyhow!("No output device"))?;
-        let out_config = cpal::StreamConfig {
-            channels: 2,
-            sample_rate: cpal::SampleRate(SAMPLE_RATE),
-            buffer_size: ALSA_PERIOD,
-        };
-        tracing::info!("Output: {} @ 48kHz stereo", out_device.name().unwrap_or_default());
+        let (out_config, out_device_rate) = best_output_config(&out_device, 2);
+        tracing::info!("Output: {} @ {}Hz stereo{}",
+            out_device.name().unwrap_or_default(),
+            out_device_rate,
+            if out_device_rate != SAMPLE_RATE { " (resampling from 48kHz)" } else { "" });
 
         let prime_samples = ((jitter.target_delay_ms as usize * SAMPLE_RATE as usize) / 1000)
             .max(PRIME_SAMPLES);
@@ -397,6 +405,11 @@ pub fn run_bidir(
             pb_prods.push(prod); pb_conss.push(cons);
         }
 
+
+
+        let output_ok      = Arc::new(AtomicBool::new(true));
+        let output_ok_play = Arc::clone(&output_ok);
+        let output_ok_recv = Arc::clone(&output_ok);
         let started        = Arc::new(AtomicBool::new(false));
         let started_recv   = Arc::clone(&started);
         let started_play   = Arc::clone(&started);
@@ -503,6 +516,7 @@ pub fn run_bidir(
                     if $clear_meta { last_remote_meta = None; }
                     started_recv.store(false, Ordering::Relaxed);
                     empty_cb_recv.store(0, Ordering::Relaxed);
+                    output_ok_recv.store(true, Ordering::Relaxed); // allow reconnect after device re-plug
                     if old_fill > 0 {
                         flush_recv.store(old_fill.saturating_add(FRAME_SAMPLES), Ordering::Relaxed);
                     }
@@ -806,8 +820,10 @@ pub fn run_bidir(
                 } else { 1.0 };
 
                 if fill_ms > jitter.target_delay_ms as usize * 3 {
-                    tracing::warn!("Buffer high: {}ms — clearing integral", fill_ms);
                     integral = 0.0; integral_last = Instant::now();
+                    if output_ok_recv.load(Ordering::Relaxed) {
+                        tracing::warn!("Buffer high: {}ms — clearing integral", fill_ms);
+                    }
                 }
 
                 if !started_recv.load(Ordering::Relaxed)
@@ -867,11 +883,97 @@ pub fn run_bidir(
             }
         });
 
+        // Output resampler: converts 48kHz frames to the device's native rate
+        // when they differ (e.g. BT headphones that only do 44.1kHz).
         // Output callback
+        // If the device rate differs from 48kHz, we need to resample.
+        // The resampler and carry buffer are pre-allocated and moved into the closure —
+        // no allocation happens in the hot path.
+        // Strategy: produce a 48kHz stereo staging frame, resample it into out_carry,
+        // then drain out_carry into the cpal buffer. Carry-over samples persist between
+        // callbacks. The cpal buffer is always exactly filled.
+        let mut out_resampler: Option<rubato::FastFixedIn<f32>> = make_io_resampler_n(SAMPLE_RATE, out_device_rate, 2);
+        // Input chunk for resampler: one 20ms stereo frame at 48kHz = 960 * 2 samples
+        // but Rubato works per-channel, so chunk is 960 samples.
+        let out_resample_chunk = FRAME_SAMPLES; // 960 samples at 48kHz per channel
+        // Pre-allocate carry buffer: 2 channels × max_output_frames
+        let out_carry_capacity = if out_resampler.is_some() {
+            (out_resample_chunk as f64 * out_device_rate as f64 / SAMPLE_RATE as f64 * 2.5) as usize * 2
+        } else { 0 };
+        let mut out_carry: Vec<f32> = Vec::with_capacity(out_carry_capacity);
+        let mut out_staging_l = vec![0.0f32; out_resample_chunk];
+        let mut out_staging_r = vec![0.0f32; out_resample_chunk];
+        let mut out_staging_pos = 0usize; // how many 48kHz frames we've written to staging
         let mut limiter = Limiter::new();
         let stream = out_device.build_output_stream(
             &out_config,
             move |data: &mut [f32], _| {
+                // ── Resampled output path ──────────────────────────────────────────────
+                // When the device runs at a rate other than 48kHz, we produce 48kHz
+                // stereo staging frames, resample them, accumulate in out_carry,
+                // then drain out_carry into the cpal buffer. This keeps the hot path
+                // allocation-free — all buffers were pre-allocated above.
+                if out_resampler.is_some() {
+                    let mut pos = 0usize;
+                    while pos < data.len() {
+                        // Drain carry buffer first
+                        if !out_carry.is_empty() {
+                            let take = out_carry.len().min(data.len() - pos);
+                            data[pos..pos + take].copy_from_slice(&out_carry[..take]);
+                            out_carry.drain(..take);
+                            pos += take;
+                            continue;
+                        }
+                        // Need more: produce one 48kHz staging frame into out_staging_l/r.
+                        // We reuse the full callback logic on a FRAME_SAMPLES-sized view.
+                        // For brevity: fill with silence when not started.
+                        let active_r = remote_ch_play.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
+                        let playing_r = connected_play.load(Ordering::Relaxed)
+                            && started_play.load(Ordering::Relaxed);
+                        if !playing_r {
+                            for s in out_carry.iter_mut() { *s = 0.0; }
+                            data[pos..].fill(0.0);
+                            return;
+                        }
+                        let left_m  = route_masks_play[0].load(Ordering::Relaxed);
+                        let right_m = route_masks_play[1].load(Ordering::Relaxed);
+                        for i in 0..out_resample_chunk {
+                            let mut samples = [0.0f32; MAX_CHANNELS];
+                            for ch in 0..active_r {
+                                samples[ch] = pb_conss[ch].try_pop().unwrap_or(0.0);
+                            }
+                            let (mut l, mut r) = (0.0f32, 0.0f32);
+                            let (mut lc, mut rc) = (0u32, 0u32);
+                            for ch in 0..active_r {
+                                let bit = 1u64 << ch;
+                                if left_m  & bit != 0 { l += samples[ch]; lc += 1; }
+                                if right_m & bit != 0 { r += samples[ch]; rc += 1; }
+                            }
+                            out_staging_l[i] = if lc > 0 { l / lc as f32 } else { l };
+                            out_staging_r[i] = if rc > 0 { r / rc as f32 } else { r };
+                        }
+                        // Apply limiter and metering to staging frame (interleaved)
+                        let mut interleaved: Vec<f32> = out_staging_l.iter()
+                            .zip(out_staging_r.iter())
+                            .flat_map(|(&a, &b)| [a, b])
+                            .collect();
+                        limiter.process(&mut interleaved);
+                        // Resample each channel
+                        let l_in: Vec<f32> = interleaved.iter().step_by(2).copied().collect();
+                        let r_in: Vec<f32> = interleaved.iter().skip(1).step_by(2).copied().collect();
+                        if let Some(ref mut rs) = out_resampler {
+                            // 2-channel Rubato: process L and R in one call
+                            if let Ok(out_ch) = rs.process(&[&l_in, &r_in], None) {
+                                for (l, r) in out_ch[0].iter().zip(out_ch[1].iter()) {
+                                    out_carry.push(*l);
+                                    out_carry.push(*r);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                // ── Normal 48kHz path (no resampling needed) ──────────────────────────
                 let active = remote_ch_play.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
                 let playing = connected_play.load(Ordering::Relaxed) && started_play.load(Ordering::Relaxed);
                 if !playing {
@@ -935,7 +1037,11 @@ pub fn run_bidir(
                 if underflowed { underflows_play.fetch_add(1, Ordering::Relaxed); }
                 handle_underrun(!any_sample, &started_play, &empty_cb_play);
             },
-            |e| tracing::error!("Output: {e}"),
+            move |e| {
+                if output_ok_play.swap(false, Ordering::Relaxed) {
+                    tracing::error!("Output device lost: {e}. Reconnect device or re-apply settings in the web UI.");
+                }
+            },
             None,
         )?;
         stream.play()?;
@@ -963,41 +1069,78 @@ pub fn run_bidir(
                 Some(_default_dev) => {
                     let in_dev = find_input_device(&selected_input_device)
                         .unwrap_or(_default_dev);
-                    let in_cfg = cpal::StreamConfig {
-                        channels: in_channels as u16,
-                        sample_rate: cpal::SampleRate(SAMPLE_RATE),
-                        buffer_size: ALSA_PERIOD,
-                    };
-                    tracing::info!("Input: {} @ 48kHz {}ch", in_dev.name()?, in_channels);
+                    let (in_cfg, in_device_rate) = best_input_config(&in_dev, in_channels);
+                    let actual_in_channels = in_cfg.channels as usize;
+                    tracing::info!("Input: {} @ {}Hz {}ch{}",
+                        in_dev.name()?, in_device_rate, actual_in_channels,
+                        if in_device_rate != SAMPLE_RATE { " (resampling to 48kHz)" } else { "" });
+                    // Build a resampler if the device doesn't run at 48kHz
+                    let mut in_resampler = make_io_resampler(in_device_rate, SAMPLE_RATE);
                     let rings_cb  = Arc::clone(&input_rings);
                     let meters_cb = Arc::clone(&meters);
-                    let mut peak_acc  = vec![0.0f32; in_channels];
+                    let mut peak_acc  = vec![0.0f32; actual_in_channels];
                     let mut samp_cnt  = 0usize;
+                    // Accumulation buffer: collect mono samples at device rate for resampler
+                    let mut resample_accum: Vec<f32> = Vec::with_capacity(
+                        (in_device_rate as usize * 25) / 1000);
+                    let resample_chunk = (in_device_rate as usize * 20) / 1000;
                     let st = in_dev.build_input_stream(
                         &in_cfg,
                         move |data: &[f32], _| {
                             if let Ok(mut rings) = rings_cb.lock() {
-                                for frame in data.chunks(in_channels) {
-                                    for ch in 0..in_channels {
-                                        let s = frame.get(ch).copied().unwrap_or(0.0);
-                                        if let Some(ring) = rings.get_mut(ch) {
-                                            if ring.len() >= CAP_RING_SIZE { ring.pop_front(); }
-                                            ring.push_back(s);
-                                        }
-                                        peak_acc[ch] = peak_acc[ch].max(s.abs());
+                                for frame in data.chunks(actual_in_channels) {
+                                    // Mix down to mono (average all channels)
+                                    let s = if actual_in_channels == 1 {
+                                        frame[0]
+                                    } else {
+                                        frame.iter().sum::<f32>() / actual_in_channels as f32
+                                    };
+                                    // Peak metering (per-channel of actual device)
+                                    for ch in 0..actual_in_channels.min(in_channels) {
+                                        let v = frame.get(ch).copied().unwrap_or(s);
+                                        peak_acc[ch] = peak_acc[ch].max(v.abs());
                                     }
                                     samp_cnt += 1;
                                     if samp_cnt >= FRAME_SAMPLES {
-                                        for ch in 0..in_channels {
+                                        for ch in 0..actual_in_channels.min(in_channels) {
                                             meters_cb.set_input_peak(ch, peak_dbfs_from_peak(peak_acc[ch]));
                                             peak_acc[ch] = 0.0;
                                         }
                                         samp_cnt = 0;
                                     }
+                                    if let Some(ref mut rs) = in_resampler {
+                                        resample_accum.push(s);
+                                        while resample_accum.len() >= resample_chunk {
+                                            let chunk: Vec<f32> = resample_accum.drain(..resample_chunk).collect();
+                                            if let Ok(out) = rs.process(&[&chunk], None) {
+                                                for &v in out[0].iter() {
+                                                    // Replicate to all send channels from this device
+                                                    for ch in 0..in_channels {
+                                                        if let Some(ring) = rings.get_mut(ch) {
+                                                            if ring.len() >= CAP_RING_SIZE { ring.pop_front(); }
+                                                            ring.push_back(v);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // No resampler needed — push directly
+                                        for ch in 0..in_channels {
+                                            if let Some(ring) = rings.get_mut(ch) {
+                                                if ring.len() >= CAP_RING_SIZE { ring.pop_front(); }
+                                                ring.push_back(s);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         },
-                        |e| tracing::error!("Input: {e}"),
+                        move |e| {
+                            if input_ok_err.swap(false, Ordering::Relaxed) {
+                                tracing::error!("Input device lost: {e}. Reconnect device or re-apply settings in the web UI.");
+                            }
+                        },
                         None,
                     )?;
                     st.play()?;

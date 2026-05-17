@@ -84,6 +84,7 @@ pub struct StatusResponse {
     pub last_control_age_ms: u64,
     pub last_audio_age_ms: u64,
     pub remote_conflict: Option<String>,
+    pub discovered_peer_addr: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +118,8 @@ pub async fn status_handler(State(state): State<WebState>) -> Json<StatusRespons
         last_control_age_ms: if last_control == 0 { 0 } else { now_ms.saturating_sub(last_control) },
         last_audio_age_ms:   if last_audio   == 0 { 0 } else { now_ms.saturating_sub(last_audio) },
         remote_conflict,
+        discovered_peer_addr: state.established_peer_addr.lock().ok()
+            .and_then(|g| *g).map(|a| a.ip().to_string()),
     })
 }
 
@@ -298,7 +301,7 @@ pub async fn setup_apply_handler(
 
     save_persisted_config(PersistedRuntimeConfig {
         remote: if remote.is_empty() { None } else { Some(split_host_port(remote)) },
-        remote_device_name: Some(remote_device_name.to_string()),
+        remote_device_name: if remote_device_name.is_empty() { None } else { Some(remote_device_name.to_string()) },
         link_password: if link_password.is_empty() { None } else { Some(link_password.to_string()) },
         node_id: Some(node_id.to_string()),
         token_hex: Some(token_hex.clone()),
@@ -368,6 +371,10 @@ pub async fn streams_handler(State(state): State<WebState>) -> Json<serde_json::
 
 pub async fn devices_handler(State(state): State<WebState>) -> Json<DeviceResponse> {
     Json((*state.devices).clone())
+}
+
+pub async fn config_handler() -> Json<crate::persistence::PersistedUiState> {
+    Json(crate::persistence::load_persisted_state())
 }
 
 pub async fn interfaces_handler() -> Json<Vec<NetworkInterface>> {
@@ -573,6 +580,7 @@ pub fn control_web_state(
     opus_bitrate_per_channel: u32,
     jitter: JitterConfig,
     encoder_mode: EncoderMode,
+    rendezvous_url: Option<String>,
 ) -> anyhow::Result<WebState> {
     let send_channels       = send_channels.clamp(1, MAX_CHANNELS);
     let handshake_connected = Arc::new(AtomicBool::new(false));
@@ -623,7 +631,7 @@ pub fn control_web_state(
             effective_latency_ms: jitter.target_delay_ms,
             fixed_jitter: !jitter.adaptive, phase_lock: jitter.phase_lock,
             encoder_mode: encoder_mode.as_str().to_string(),
-            link_password_configured: false, rendezvous_url: String::new(),
+            link_password_configured: false, rendezvous_url: rendezvous_url.clone().unwrap_or_default(),
             bind_addr: "0.0.0.0".into(),
             selected_input_device: None,
             selected_output_device: None,
@@ -631,6 +639,7 @@ pub fn control_web_state(
         },
         devices,
         restart_lock: Arc::new(Mutex::new(())),
+        established_peer_addr: Arc::new(Mutex::new(None)),
         rtt_us10: Arc::new(AtomicU32::new(0)),
         remote_conflict: Arc::new(Mutex::new(None)),
     };
@@ -662,6 +671,7 @@ pub fn spawn_web_ui(addr: String, state: WebState) {
                 .route("/api/stats",            get(stats_handler))
                 .route("/api/remotestatus",     get(remotestatus_handler))
                 .route("/api/device-ip",        get(device_ip_handler))
+                .route("/api/config",           get(config_handler))
                 .route("/api/interfaces",       get(interfaces_handler))
                 .route("/api/events",           get(events_handler))
                 .with_state(state);

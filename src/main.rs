@@ -22,6 +22,29 @@ use jitter::effective_receive_buffer_ms;
 use engine::run_bidir;
 use web::{spawn_web_ui, control_web_state};
 
+/// Lightweight rendezvous registration — runs even in web-first mode so the
+/// node is discoverable before the audio engine starts.
+fn spawn_rendezvous_registration(rdv_url: String, node_id: String) {
+    std::thread::spawn(move || {
+        let base = {
+            let u = rdv_url.trim_end_matches('/');
+            if u.starts_with("http://") || u.starts_with("https://") { u.to_string() }
+            else { format!("https://{u}") }
+        };
+        let body = serde_json::json!({ "name": node_id, "port": PORT }).to_string();
+        loop {
+            match ureq::post(&format!("{base}/api/register"))
+                .set("Content-Type", "application/json")
+                .send_string(&body)
+            {
+                Ok(_)  => tracing::debug!("rendezvous: registered '{node_id}'"),
+                Err(e) => tracing::warn!("rendezvous: register failed: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        }
+    });
+}
+
 fn main() -> Result<()> {
     // Logging: RUST_LOG overrides; default is "info"
     // RUST_LOG controls log level; default is info.
@@ -66,7 +89,6 @@ fn run_bidir_from_args(args: &[String]) -> Result<()> {
     let mut no_web  = false;
     let mut no_send = false;
     let mut no_recv = false;
-    let monitor = MonitorMode::PatchMatrix;
     let mut explicit_token: Option<[u8; 16]> = saved.token_hex.as_deref()
         .and_then(|h| parse_token_arg(h).ok());
     let mut link_password: Option<String> = saved.link_password.clone();
@@ -75,13 +97,12 @@ fn run_bidir_from_args(args: &[String]) -> Result<()> {
     let mut bind_addr: String = saved.bind_addr.clone().unwrap_or_else(|| "0.0.0.0".to_string());
     let mut selected_input_device: Option<String> = saved.selected_input_device.clone();
     let mut selected_output_device: Option<String> = saved.selected_output_device.clone();
-    let mut remote_host_flag = false;
 
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--remote-host" | "-r" => {
-                i += 1; remote_host = args.get(i).cloned().unwrap_or_default(); remote_host_flag = true;
+                i += 1; remote_host = args.get(i).cloned().unwrap_or_default();
             }
             "--remote-name" => { i += 1; remote_device_name = args.get(i).cloned().unwrap_or_default(); }
             "--id"          => { i += 1; node_id = args.get(i).cloned().unwrap_or_else(default_node_id); }
@@ -123,7 +144,6 @@ fn run_bidir_from_args(args: &[String]) -> Result<()> {
             arg if !arg.starts_with('-') && i == 2 => {
                 // Positional: first non-flag arg can be remote host
                 remote_host = arg.to_string();
-                remote_host_flag = true;
             }
             arg => { tracing::warn!("Unknown arg: {arg}"); }
         }
@@ -159,10 +179,21 @@ fn run_bidir_from_args(args: &[String]) -> Result<()> {
         phase_lock,
     };
 
-    // Web-first mode: no remote configured, start control UI immediately
-    if remote_host.is_empty() && !remote_host_flag && !no_web {
+    // Web-first mode: only enter if no remote is configured at all.
+    // If remote_device_name is set (even without an IP), go into run_bidir
+    // so the rendezvous thread starts and the node registers as connectable.
+    if remote_host.is_empty() && remote_device_name.is_empty() && !no_web {
+        // Register with rendezvous even in web-first mode so the node is
+        // discoverable while the user is configuring it.
+        if let Some(ref url) = rendezvous_url {
+            if !url.trim().is_empty() {
+                spawn_rendezvous_registration(url.clone(), node_id.clone());
+                tracing::info!("rendezvous: background registration started for '{node_id}'");
+            }
+        }
         let state = control_web_state(
             node_id, shared_token, channels, bitrate, jitter, encoder_mode,
+            rendezvous_url.clone(),
         )?;
         let web_addr = format!("0.0.0.0:{}", web_port.unwrap_or(8080));
         spawn_web_ui(web_addr, state);

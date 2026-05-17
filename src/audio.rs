@@ -192,15 +192,23 @@ pub fn scan_audio_devices_once() -> DeviceResponse {
     let default_input_channels = default_input_device.as_ref()
         .and_then(|d| d.default_input_config().ok())
         .map(|c| c.channels() as usize).unwrap_or(0);
+    let default_input_sample_rate = default_input_device.as_ref()
+        .and_then(|d| d.default_input_config().ok())
+        .map(|c| c.sample_rate().0).unwrap_or(SAMPLE_RATE);
     let default_output_channels = default_output_device.as_ref()
         .and_then(|d| d.default_output_config().ok())
         .map(|c| c.channels() as usize).unwrap_or(0);
+    let default_output_sample_rate = default_output_device.as_ref()
+        .and_then(|d| d.default_output_config().ok())
+        .map(|c| c.sample_rate().0).unwrap_or(SAMPLE_RATE);
     let default_input  = default_input_device.and_then(|d| d.name().ok()).unwrap_or_else(|| "none".into());
     let default_output = default_output_device.and_then(|d| d.name().ok()).unwrap_or_else(|| "none".into());
     let inputs  = host.input_devices().map(|ds| ds.filter_map(|d| d.name().ok()).collect()).unwrap_or_default();
     let outputs = host.output_devices().map(|ds| ds.filter_map(|d| d.name().ok()).collect()).unwrap_or_default();
     DeviceResponse { sample_rate: SAMPLE_RATE, default_input, default_output,
-        default_input_channels, default_output_channels, inputs, outputs }
+        default_input_channels, default_output_channels,
+        default_input_sample_rate, default_output_sample_rate,
+        inputs, outputs }
 }
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
@@ -216,4 +224,82 @@ pub fn sleep_until(deadline: Instant) {
             std::thread::yield_now();
         }
     }
+}
+
+// ─── Device config helpers ────────────────────────────────────────────────────
+
+/// Check whether a device supports a specific sample rate and channel count.
+fn input_supports_rate(device: &cpal::Device, rate: u32, channels: u16) -> bool {
+    use cpal::traits::DeviceTrait;
+    device.supported_input_configs().ok()
+        .map(|cfgs| cfgs.into_iter().any(|c|
+            c.channels() >= channels
+                && c.min_sample_rate().0 <= rate
+                && c.max_sample_rate().0 >= rate))
+        .unwrap_or(false)
+}
+
+fn output_supports_rate(device: &cpal::Device, rate: u32, channels: u16) -> bool {
+    use cpal::traits::DeviceTrait;
+    device.supported_output_configs().ok()
+        .map(|cfgs| cfgs.into_iter().any(|c|
+            c.channels() >= channels
+                && c.min_sample_rate().0 <= rate
+                && c.max_sample_rate().0 >= rate))
+        .unwrap_or(false)
+}
+
+/// Returns `(stream_config, device_sample_rate)`.
+/// Tries 48kHz first; if the device doesn't support it, falls back to the
+/// device's default rate.  The caller is responsible for resampling if
+/// `device_sample_rate != SAMPLE_RATE`.
+pub fn best_input_config(device: &cpal::Device, preferred_channels: usize) -> (cpal::StreamConfig, u32) {
+    use cpal::traits::DeviceTrait;
+    let native = device.default_input_config()
+        .map(|c| (c.sample_rate().0, c.channels()))
+        .unwrap_or((SAMPLE_RATE, preferred_channels as u16));
+    let channels = (preferred_channels as u16).min(native.1).max(1);
+    let rate = if input_supports_rate(device, SAMPLE_RATE, channels) {
+        SAMPLE_RATE
+    } else {
+        tracing::warn!(
+            "Input device doesn't support {}Hz/{}ch — using {}Hz/{}ch + software resample",
+            SAMPLE_RATE, channels, native.0, channels
+        );
+        native.0
+    };
+    (cpal::StreamConfig { channels, sample_rate: cpal::SampleRate(rate), buffer_size: ALSA_PERIOD }, rate)
+}
+
+pub fn best_output_config(device: &cpal::Device, preferred_channels: u16) -> (cpal::StreamConfig, u32) {
+    use cpal::traits::DeviceTrait;
+    let native = device.default_output_config()
+        .map(|c| (c.sample_rate().0, c.channels()))
+        .unwrap_or((SAMPLE_RATE, preferred_channels));
+    let rate = if output_supports_rate(device, SAMPLE_RATE, preferred_channels) {
+        SAMPLE_RATE
+    } else {
+        tracing::warn!(
+            "Output device doesn't support {}Hz — using {}Hz + software resample",
+            SAMPLE_RATE, native.0
+        );
+        native.0
+    };
+    // Always stereo on output
+    (cpal::StreamConfig { channels: preferred_channels, sample_rate: cpal::SampleRate(rate), buffer_size: ALSA_PERIOD }, rate)
+}
+
+/// Build a Rubato resampler from `from_rate` to `to_rate` with `channels` channels.
+/// Returns `None` if rates are equal (no resampling needed).
+pub fn make_io_resampler_n(from_rate: u32, to_rate: u32, channels: usize) -> Option<rubato::FastFixedIn<f32>> {
+    if from_rate == to_rate { return None; }
+    let ratio = to_rate as f64 / from_rate as f64;
+    let chunk = (from_rate as usize * 20) / 1000;
+    Some(rubato::FastFixedIn::new(ratio, 1.1, rubato::PolynomialDegree::Linear, chunk, channels)
+        .expect("IO resampler init failed"))
+}
+
+/// Mono resampler — convenience wrapper for input capture path.
+pub fn make_io_resampler(from_rate: u32, to_rate: u32) -> Option<rubato::FastFixedIn<f32>> {
+    make_io_resampler_n(from_rate, to_rate, 1)
 }

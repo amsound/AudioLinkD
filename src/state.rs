@@ -155,6 +155,8 @@ pub struct DeviceResponse {
     pub default_output: String,
     pub default_input_channels: usize,
     pub default_output_channels: usize,
+    pub default_input_sample_rate: u32,
+    pub default_output_sample_rate: u32,
     pub inputs: Vec<String>,
     pub outputs: Vec<String>,
 }
@@ -242,6 +244,7 @@ pub struct WebState {
     pub runtime: RuntimeSummary,
     pub devices: Arc<DeviceResponse>,
     pub restart_lock: Arc<Mutex<()>>,
+    pub established_peer_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
     pub rtt_us10: Arc<AtomicU32>,
     pub remote_conflict: Arc<Mutex<Option<String>>>,
 }

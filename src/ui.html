@@ -9,7 +9,8 @@
 body.light{--bg:#f0f3f7;--panel:#fff;--panel2:#e6eaf0;--ink:#111820;--muted:#6b7a8d;--line:#ccd3de;--cell:#dde3ec;--blue2:#1858a8;--hbg:#fff;--hborder:#ccd3de;--nbg:#f5f7fa;--logo:#111820;--htext:#5a6a7a}
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:var(--bg);color:var(--ink);font:13.5px/1.5 'IBM Plex Sans','Segoe UI',system-ui,sans-serif;transition:background .2s,color .2s}
-input,select,button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 10px;transition:background .2s,color .2s,border-color .2s}
+input,select{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:0 10px;height:36px;transition:background .2s,color .2s,border-color .2s}
+button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:0 10px;height:36px;display:inline-flex;align-items:center;justify-content:center;transition:background .2s,color .2s,border-color .2s}
 input:focus,select:focus{outline:2px solid var(--blue);outline-offset:1px;border-color:transparent}
 button{cursor:pointer}
 header{display:flex;align-items:center;justify-content:space-between;padding:11px 20px;border-bottom:1px solid var(--hborder);background:var(--hbg);position:sticky;top:0;z-index:20;gap:10px;transition:background .2s,border-color .2s}
@@ -17,7 +18,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:11p
 .logo span{color:var(--blue)}
 .nodeline{color:var(--htext);font-size:11px;margin-top:2px;font-family:var(--mono);transition:color .2s}
 .hright{display:flex;align-items:center;gap:9px;flex-shrink:0}
-.theme-btn{background:transparent;border:1px solid var(--hborder);border-radius:16px;padding:4px 10px;font-size:11px;color:var(--htext);transition:border-color .2s,color .2s}
+.theme-btn{background:transparent;border:1px solid var(--hborder);border-radius:16px;padding:0 10px;height:28px;font-size:11px;color:var(--htext);transition:border-color .2s,color .2s}
 .theme-btn:hover{border-color:var(--muted);color:var(--ink)}
 .conn-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:18px;font-size:12px;font-weight:600;border:1px solid;white-space:nowrap}
 .conn-badge.green{background:rgba(29,186,91,.1);border-color:rgba(29,186,91,.4);color:#3ed47a}
@@ -29,7 +30,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding:11p
 .lamp.gray{background:#3a4a5a}
 body.light .lamp.gray{background:#a0b0c0}
 nav{display:flex;gap:5px;padding:8px 20px;background:var(--nbg);border-bottom:1px solid var(--line);position:sticky;top:51px;z-index:19;overflow-x:auto;transition:background .2s,border-color .2s}
-.tab{padding:5px 13px;border-radius:7px;font-size:13px;font-weight:500;border:1px solid transparent;background:transparent;color:var(--muted);white-space:nowrap;transition:.12s}
+.tab{padding:0 13px;height:30px;border-radius:7px;font-size:13px;font-weight:500;border:1px solid transparent;background:transparent;color:var(--muted);white-space:nowrap;transition:.12s}
 .tab:hover{color:var(--ink);background:var(--panel)}
 .tab.active{background:var(--blue2);color:#c8e0ff;border-color:rgba(77,159,255,.28)}
 body.light .tab.active{color:#fff}
@@ -85,7 +86,7 @@ details[open] summary::before{transform:rotate(90deg)}
 .mlbl{font-size:10px;color:var(--muted);text-align:center;width:44px;line-height:1.3}
 .page.routing{margin:-16px -20px 0}
 .route-toolbar{display:flex;align-items:center;gap:10px;padding:9px 20px;background:var(--nbg);border-bottom:1px solid var(--line);transition:background .2s}
-.route-btn{padding:5px 14px;font-size:12px;font-weight:600;background:var(--panel);border:1px solid var(--line);border-radius:7px;color:var(--muted);transition:color .15s,border-color .15s,background .15s}
+.route-btn{padding:0 14px;height:30px;font-size:12px;font-weight:600;background:var(--panel);border:1px solid var(--line);border-radius:7px;color:var(--muted);transition:color .15s,border-color .15s,background .15s}
 .route-btn:hover{color:var(--ink);border-color:var(--muted)}
 .route-btn.arm{background:rgba(224,64,64,.1);border-color:rgba(224,64,64,.5);color:var(--red);animation:armPulse .25s ease}
 @keyframes armPulse{from{transform:scale(1.04)}to{transform:scale(1)}}
@@ -127,24 +128,26 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
 .field input,.field select{width:100%}
 .idrow{display:flex;gap:6px}
 .idrow input{flex:1;font-family:var(--mono);font-size:13px;font-weight:600}
-.cpybtn{padding:7px 10px;font-size:12px;background:var(--panel2);border-color:var(--line);white-space:nowrap;flex-shrink:0}
-.savebtn{padding:7px 10px;font-size:12px;background:var(--blue2);border-color:rgba(77,159,255,.38);color:#c8e0ff;white-space:nowrap;flex-shrink:0;display:none}
+.cpybtn{font-size:12px;background:var(--panel2);border-color:var(--line);white-space:nowrap;flex-shrink:0}
+.savebtn{font-size:12px;background:var(--blue2);border-color:rgba(77,159,255,.38);color:#c8e0ff;white-space:nowrap;flex-shrink:0;display:none}
 .savebtn.show{display:inline-block}
 .mpill{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:18px;font-size:12px;font-weight:700;border:1px solid;transition:.2s;margin-top:11px}
 .mpill.rdv{background:rgba(77,159,255,.09);border-color:rgba(77,159,255,.32);color:#5ab0f0}
 .mpill.dir{background:rgba(29,186,91,.09);border-color:rgba(29,186,91,.32);color:#3dcc72}
 .mpill.pas{background:rgba(100,120,140,.06);border-color:rgba(100,120,140,.22);color:var(--muted)}
 .mdot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:currentColor}
-.crow{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)}
+.crow{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);min-height:48px}
 .crow:last-child{border-bottom:none}
 .ck{font-size:12px;color:var(--muted)}
-.cv select{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px}
-.cv input[type=checkbox]{width:auto;margin:0;accent-color:var(--green)}
-.applybtn{width:100%;padding:8px 11px;margin-top:10px;background:var(--blue2);border-color:rgba(77,159,255,.38);color:#c8e0ff;font-size:12px;font-weight:600;border-radius:8px;transition:background .15s,border-color .15s,color .15s}
+.cv select{background:var(--bg);border:1px solid var(--line);border-radius:7px;font-size:13px}
+.cv input[type=checkbox]{width:auto;margin:0;height:16px;width:16px;accent-color:var(--green);cursor:pointer}
+.applybtn{width:100%;height:38px;padding:0 11px;margin-top:10px;background:var(--blue2);border-color:rgba(77,159,255,.38);color:#c8e0ff;font-size:12px;font-weight:600;border-radius:8px;transition:background .15s,border-color .15s,color .15s}
 .applybtn:hover{background:#2870c4}
+.applybtn.dirty{background:rgba(240,160,48,.18);border-color:rgba(240,160,48,.6);color:var(--orange);animation:dirtyPulse 2s ease-in-out infinite}
+@keyframes dirtyPulse{0%,100%{box-shadow:0 0 0 0 rgba(240,160,48,0)}50%{box-shadow:0 0 0 4px rgba(240,160,48,.2)}}
 .applybtn.arm{background:rgba(224,64,64,.14);border-color:rgba(224,64,64,.5);color:var(--red)}
 .applybtn.done{background:rgba(29,186,91,.14);border-color:rgba(29,186,91,.4);color:var(--green);cursor:default}
-.devrow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+.devrow{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line);font-size:13px;min-height:48px}
 .devrow:last-child{border-bottom:none}
 .dk{color:var(--muted)}
 .card-divider{border:none;border-top:1px solid var(--line);margin:12px 0}
@@ -165,6 +168,7 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
   <button class="tab" data-page="rxrouting">Receive Routing</button>
   <button class="tab" data-page="meters">Meters</button>
   <button class="tab" data-page="setup">Setup</button>
+  <button class="applybtn" id="applyBtn" onclick="applySetup()" style="margin-left:auto;margin-top:0;width:auto;padding:0 18px;height:30px;font-size:12px;border-radius:7px;display:none">Apply &amp; rebuild engine</button>
 </nav>
 <main>
 <section id="home" class="page active">
@@ -190,7 +194,7 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
     </div>
   </div>
   <div class="statgrid">
-    <div class="stile"><div class="slbl">One-way latency</div><div class="sval ok" id="owVal">—<span class="u"> ms</span></div></div>
+    <div class="stile"><div class="slbl">Round-trip time</div><div class="sval dim" id="rttVal">—<span class="u"> ms</span></div></div>
     <div class="stile"><div class="slbl">TX</div><div class="sval dim"><span id="txBw">—</span><span class="u"> Mb/s</span></div></div>
     <div class="stile"><div class="slbl">RX</div><div class="sval dim"><span id="rxBw">—</span><span class="u"> Mb/s</span></div></div>
     <div class="stile"><div class="slbl">Packet loss</div><div class="sval ok" id="lossVal">—<span class="u"> %</span></div></div>
@@ -248,85 +252,73 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
   <div class="card"><div class="ctitle">Output</div><div class="mbank" id="monMeters"></div></div>
 </section>
 <section id="setup" class="page">
-  <div class="sgrid mb">
-    <div class="card">
+  <div class="sgrid mb" style="align-items:stretch">
+    <div class="card" style="display:flex;flex-direction:column">
       <div class="ctitle">This Node</div>
       <div class="field">
         <label>Device name</label>
         <div class="idrow">
-          <input id="cfgNode" autocomplete="off" spellcheck="false" oninput="nodeNameDirty()">
+          <input id="cfgNode" autocomplete="off" spellcheck="false" oninput="setupDirty()">
           <button class="cpybtn" onclick="copyFeedback(this,$('cfgNode').value)">Copy</button>
-          <button class="savebtn" id="nodeNameSave" onclick="saveNodeName()">Save</button>
         </div>
       </div>
-      <div class="field" style="margin-bottom:0">
-        <label>Device IP</label>
-        <div class="idrow">
-          <input id="deviceIpInput" readonly style="flex:1;color:var(--muted)">
-          <button class="cpybtn" onclick="copyFeedback(this,$('deviceIpInput').value)">Copy</button>
-        </div>
-      </div>
-      <hr class="card-divider">
-      <div class="field" style="margin-bottom:0">
-        <label>Network interface <span class="hint">— bind address for UDP</span></label>
-        <select id="cfgInterface" onchange="cfgDirty.interface=true" style="width:100%">
-          <option value="">Any (0.0.0.0)</option>
+      <div class="field" style="margin-bottom:0;margin-top:auto">
+        <label>Network interface</label>
+        <select id="cfgInterface" onchange="cfgDirty.interface=true;setupDirty()" style="width:100%">
+          <option value="">Any</option>
         </select>
       </div>
     </div>
-    <div class="card">
+    <div class="card" style="display:flex;flex-direction:column">
       <div class="ctitle">Connect To</div>
-      <div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.remoteName=true" style="font-family:var(--mono);font-size:13px;font-weight:600"></div>
-      <div class="field" style="margin-bottom:0"><label>Remote IP</label><input id="cfgPeer" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.peer=true" style="font-family:var(--mono);font-size:13px;font-weight:600"></div>
+      <div class="field">
+        <label>Remote device name</label>
+        <input id="cfgRemoteName" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.remoteName=true;setupDirty()" style="font-family:var(--mono);font-size:13px;font-weight:600;width:100%">
+      </div>
+      <div class="field" style="margin-bottom:0;margin-top:auto">
+        <label>Remote IP</label>
+        <input id="cfgPeer" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.peer=true;setupDirty()" style="font-family:var(--mono);font-size:13px;font-weight:600;width:100%">
+      </div>
     </div>
   </div>
-  <div class="sgrid mb" style="align-items:stretch">
+  <div class="sgrid mb" style="align-items:start">
+    <!-- Left column: single combined audio device card -->
+    <div class="card">
+      <div class="ctitle">Audio Devices</div>
+      <div class="devrow"><span class="dk">Input sample rate</span><b id="inSampleRate">—</b></div>
+      <div class="devrow"><span class="dk">Input device</span><select id="cfgInputDevice" onchange="cfgDirty.inputDevice=true;setupDirty()" style="width:50%"><option value="">Default</option></select></div>
+      <div class="devrow"><span class="dk">Input channels</span><b id="inChannels">—</b></div>
+      <div class="devrow"><span class="dk">Output sample rate</span><b id="outSampleRate">—</b></div>
+      <div class="devrow"><span class="dk">Output device</span><select id="cfgOutputDevice" onchange="cfgDirty.outputDevice=true;setupDirty()" style="width:50%"><option value="">Default</option></select></div>
+      <div class="devrow"><span class="dk">Output channels</span><b id="outChannels">—</b></div>
+    </div>
+    <!-- Right column: Codec & Transport -->
     <div class="card">
       <div class="ctitle">Codec &amp; Transport</div>
-      <div class="crow"><span class="ck">Network send channels</span><span class="cv"><select id="cfgChannels" onchange="cfgDirty.channels=true"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></span></div>
-      <div class="crow"><span class="ck">Bitrate per channel</span><span class="cv"><select id="bitrate" onchange="cfgDirty.bitrate=true"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></span></div>
-      <div class="crow"><span class="ck">Incoming buffer</span><span class="cv"><select id="rxBuffer" onchange="cfgDirty.rxBuffer=true"><option value="5">5 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="160">160 ms</option><option value="200">200 ms</option><option value="300">300 ms</option><option value="500">500 ms</option><option value="1000">1 s</option><option value="2000">2 s</option></select></span></div>
-      <div class="crow"><span class="ck">Encoder</span><span class="cv"><select id="cfgEncoderMode" onchange="cfgDirty.encoderMode=true"><option value="music">Music</option><option value="speech">Voice</option></select></span></div>
-      <div class="crow"><span class="ck">Phase lock</span><span class="cv"><input type="checkbox" id="cfgPhaseLock" checked onchange="cfgDirty.phaseLock=true"></span></div>
-      <button class="applybtn" id="applyBtn" onclick="applySetup()">Apply &amp; rebuild engine</button>
-    </div>
-    <div class="card">
-      <div class="ctitle">Advanced</div>
-      <div id="modePill" class="mpill rdv" style="margin-top:0;margin-bottom:14px"><span class="mdot"></span><span id="modeLabel">Cloud</span></div>
-      <div class="field">
-        <label>Link password</label>
-        <div style="display:flex;gap:6px"><input id="cfgLinkPw" type="password" style="flex:1" oninput="cfgDirty.linkPw=true"><button id="pwToggleBtn" onclick="togglePw()" style="padding:7px 12px;flex-shrink:0;min-width:52px">Show</button></div>
-      </div>
-      <div class="field"><label>Token override</label><input id="cfgToken" autocomplete="off" spellcheck="false"></div>
-      <div class="field" style="margin-bottom:0"><label>Rendezvous server</label><input id="cfgRendezvous" value="https://audiolink.amsound.co.uk" autocomplete="off" oninput="cfgDirty.rendezvous=true"></div>
-    </div>
-  </div>
-  <div class="card">
-    <div class="ctitle">Audio Devices</div>
-    <div id="devices"><div style="color:var(--muted);font-size:12px">Loading…</div></div>
-    <hr class="card-divider">
-    <div class="sgrid" style="gap:10px;margin-top:4px">
-      <div class="field" style="margin-bottom:0">
-        <label>Input device</label>
-        <select id="cfgInputDevice" onchange="cfgDirty.inputDevice=true" style="width:100%">
-          <option value="">Default</option>
-        </select>
-      </div>
-      <div class="field" style="margin-bottom:0">
-        <label>Output device</label>
-        <select id="cfgOutputDevice" onchange="cfgDirty.outputDevice=true" style="width:100%">
-          <option value="">Default</option>
-        </select>
+      <div class="crow"><span class="ck">Network send channels</span><span class="cv"><select id="cfgChannels" onchange="cfgDirty.channels=true;setupDirty()"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></span></div>
+      <div class="crow"><span class="ck">Bitrate per channel</span><span class="cv"><select id="bitrate" onchange="cfgDirty.bitrate=true;setupDirty()"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></span></div>
+      <div class="crow"><span class="ck">Incoming buffer</span><span class="cv"><select id="rxBuffer" onchange="cfgDirty.rxBuffer=true;setupDirty()"><option value="5">5 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="160">160 ms</option><option value="200">200 ms</option><option value="300">300 ms</option><option value="500">500 ms</option><option value="1000">1 s</option><option value="2000">2 s</option></select></span></div>
+      <div class="crow"><span class="ck">Encoder</span><span class="cv"><select id="cfgEncoderMode" onchange="cfgDirty.encoderMode=true;setupDirty()"><option value="music">Music</option><option value="speech">Voice</option></select></span></div>
+      <div class="crow"><span class="ck">Phase lock</span><span class="cv"><input type="checkbox" id="cfgPhaseLock" checked onchange="cfgDirty.phaseLock=true;setupDirty()"></span></div>
+      <div class="crow">
+        <span class="ck">Link password</span>
+        <span class="cv" style="display:flex;gap:6px;flex:1;justify-content:flex-end">
+          <input id="cfgLinkPw" type="password" style="width:50%" oninput="cfgDirty.linkPw=true;setupDirty()">
+          <button id="pwToggleBtn" onclick="togglePw()" style="flex-shrink:0;min-width:52px">Show</button>
+        </span>
       </div>
     </div>
   </div>
+  <div id="modePill"  <div id="modePill" style="display:none"><span id="modeLabel"></span></div>
+  <input id="cfgRendezvous" type="hidden" value="https://audiolink.amsound.co.uk">
+  <input id="cfgToken" type="hidden" value="">
 </section>
 </main>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 // Tab routing
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab,.page').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.page).classList.add('active')});
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab,.page').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.page).classList.add('active');const ab=$('applyBtn');if(ab)ab.style.display=b.dataset.page==='setup'?'inline-flex':'none'});
 // Theme
 const mq=window.matchMedia('(prefers-color-scheme: dark)');
 let dark;
@@ -353,12 +345,24 @@ function lossCls(p){return p>2?'bad':p>.5?'warn':'ok'}
 // Double-tap confirm
 function routeConfirm(btnId,action){if(armTimers[btnId]){clearTimeout(armTimers[btnId]);delete armTimers[btnId];$(btnId).classList.remove('arm');action()}else{$(btnId).classList.add('arm');armTimers[btnId]=setTimeout(()=>{$(btnId).classList.remove('arm');delete armTimers[btnId]},3000)}}
 // Setup
-function updateMode(){const ip=($('cfgPeer').value||'').trim(),nm=($('cfgRemoteName').value||'').trim(),p=$('modePill'),l=$('modeLabel');if(ip){p.className='mpill dir';l.textContent='Direct IP'}else if(nm){p.className='mpill rdv';l.textContent='Cloud'}else{p.className='mpill pas';l.textContent='Passive'}}
-function nodeNameDirty(){cfgDirty.node=true;$('nodeNameSave').classList.toggle('show',$('cfgNode').value!==savedNodeName)}
-function saveNodeName(){const n=$('cfgNode').value.trim();if(!n)return;savedNodeName=n;$('nodeNameSave').classList.remove('show');$('nodeLine').textContent=n}
+// Mark apply button as needing attention when any setup field changes
+function setupDirty(){
+  const btn=$('applyBtn');
+  if(btn&&!btn.classList.contains('arm')&&!btn.classList.contains('done')){
+    btn.classList.add('dirty');
+    btn.textContent='Apply & rebuild engine ●';
+  }
+}
+function clearSetupDirty(){
+  const btn=$('applyBtn');
+  if(btn){btn.classList.remove('dirty');btn.textContent='Apply & rebuild engine';}
+}
+function updateMode(){const ip=($('cfgPeer').value||'').trim(),nm=($('cfgRemoteName').value||'').trim(),p=$('modePill'),l=$('modeLabel');if(!p||!l)return;if(ip){p.className='mpill dir';l.textContent='Direct IP'}else if(nm){p.className='mpill rdv';l.textContent='Cloud'}else{p.className='mpill pas';l.textContent='Passive'}}
+function nodeNameDirty(){cfgDirty.node=true;setupDirty()}
+function saveNodeName(){const n=$('cfgNode').value.trim();if(!n)return;savedNodeName=n;$('nodeLine').textContent=n}
 function togglePw(){const f=$('cfgLinkPw'),b=$('pwToggleBtn');f.type=f.type==='password'?'text':'password';b.textContent=f.type==='password'?'Show':'Hide'}
-async function applySetup(){const btn=$('applyBtn');if(btn.classList.contains('done'))return;if(btn.classList.contains('arm')){clearTimeout(btn._armTimer);btn.classList.remove('arm');btn.disabled=true;btn.textContent='Rebuilding…';const body={remote:$('cfgPeer').value||'',remote_device_name:$('cfgRemoteName').value||'',link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value||savedNodeName,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value)||2,opus_bitrate_per_channel:Number($('bitrate').value)||128000,receive_buffer_ms:Number($('rxBuffer').value)||120,rendezvous_url:$('cfgRendezvous').value||undefined,phase_lock:$('cfgPhaseLock').checked,encoder_mode:$('cfgEncoderMode').value,bind_addr:$('cfgInterface').value||'0.0.0.0',selected_input_device:$('cfgInputDevice').value||undefined,selected_output_device:$('cfgOutputDevice').value||undefined};try{const res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const txt=await res.text();if(res.ok){btn.textContent='✓ Engine rebuilding';btn.classList.add('done');btn.disabled=false;setTimeout(()=>{btn.classList.remove('done');btn.textContent='Apply & rebuild engine'},3000)}else{btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+txt)}}catch(e){btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+e)}}else{btn.classList.add('arm');btn.textContent='Confirm rebuild';btn._armTimer=setTimeout(()=>{btn.classList.remove('arm');btn.textContent='Apply & rebuild engine'},3000)}}
-function updateSetupFromStatus(){if(!cfgDirty.node){$('cfgNode').value=status.node_id||'';if(!savedNodeName)savedNodeName=status.node_id||''}if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.rendezvous)$('cfgRendezvous').value=status.runtime?.rendezvous_url||'https://audiolink.amsound.co.uk';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels||2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel||128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms||120);if(!cfgDirty.encoderMode)setSelectValue('cfgEncoderMode',status.runtime?.encoder_mode||'music');if(!cfgDirty.phaseLock){const pl=$('cfgPhaseLock');if(pl)pl.checked=status.runtime?.phase_lock!==false}
+async function applySetup(){const btn=$('applyBtn');if(btn.classList.contains('done'))return;if(btn.classList.contains('arm')){clearTimeout(btn._armTimer);btn.classList.remove('arm');btn.disabled=true;btn.textContent='Rebuilding…';const body={remote:$('cfgPeer').value||'',remote_device_name:$('cfgRemoteName').value||'',link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value||savedNodeName,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value)||2,opus_bitrate_per_channel:Number($('bitrate').value)||128000,receive_buffer_ms:Number($('rxBuffer').value)||120,rendezvous_url:$('cfgRendezvous').value||undefined,phase_lock:$('cfgPhaseLock').checked,encoder_mode:$('cfgEncoderMode').value,bind_addr:$('cfgInterface').value||'0.0.0.0',selected_input_device:$('cfgInputDevice').value||undefined,selected_output_device:$('cfgOutputDevice').value||undefined};try{const res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const txt=await res.text();if(res.ok){clearSetupDirty();btn.textContent='✓ Engine rebuilding';btn.classList.add('done');btn.disabled=false;setTimeout(()=>{btn.classList.remove('done');btn.textContent='Apply & rebuild engine'},3000)}else{btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+txt)}}catch(e){btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+e)}}else{btn.classList.add('arm');btn.textContent='Confirm rebuild';btn._armTimer=setTimeout(()=>{btn.classList.remove('arm');btn.textContent='Apply & rebuild engine'},3000)}}
+function updateSetupFromStatus(){if(!cfgDirty.node){$('cfgNode').value=status.node_id||'';if(!savedNodeName)savedNodeName=status.node_id||''}if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];$('cfgRendezvous').value=status.runtime?.rendezvous_url||'https://audiolink.amsound.co.uk';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels||2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel||128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms||120);if(!cfgDirty.encoderMode)setSelectValue('cfgEncoderMode',status.runtime?.encoder_mode||'music');if(!cfgDirty.phaseLock){const pl=$('cfgPhaseLock');if(pl)pl.checked=status.runtime?.phase_lock!==false}
   if(!cfgDirty.interface){const s=$('cfgInterface');if(s){const v=status.runtime?.bind_addr||'';if(v&&v!=='0.0.0.0')s.value=v;else s.value=''}}
   if(!cfgDirty.inputDevice){const s=$('cfgInputDevice');if(s)s.value=status.runtime?.selected_input_device||''}
   if(!cfgDirty.outputDevice){const s=$('cfgOutputDevice');if(s)s.value=status.runtime?.selected_output_device||''}
@@ -393,7 +397,7 @@ function render(){
   const rn=$('remoteNameHome');
   if(st!=='gray'){rn.textContent=remote.node_id||status.runtime?.remote_device_name||'—';rn.style.color='var(--ink)';const chips=[];if((remote.channels||0)>0)chips.push(remote.channels+' ch');$('remoteChips').innerHTML=chips.map(ch=>`<span class="nsub-chip">${esc(ch)}</span>`).join('')}
   else{rn.textContent='—';rn.style.color='var(--muted)';$('remoteChips').innerHTML=''}
-  const ow=stats.one_way_latency_ms||0;$('owVal').innerHTML=ow.toFixed(1)+'<span class="u"> ms</span>';$('owVal').className='sval '+rttCls(ow);
+  const rttDisplay=stats.rtt_ms||0;$('rttVal').innerHTML=rttDisplay.toFixed(1)+'<span class="u"> ms</span>';
   $('txBw').textContent=(stats.tx_mbps||0).toFixed(3);$('rxBw').textContent=(stats.rx_mbps||0).toFixed(3);
   const loss=stats.loss_percent||0;$('lossVal').innerHTML=loss.toFixed(2)+'<span class="u"> %</span>';$('lossVal').className='sval '+lossCls(loss);
   const jit=stats.jitter_ms||0;$('jitterVal').innerHTML=jit.toFixed(1)+'<span class="u"> ms</span>';$('jitterVal').className='sval '+(jit>20?'warn':'ok');
@@ -406,14 +410,19 @@ function render(){
   // Position the legend target label at the same % as the tick
   const lbl=$('bufTickLbl');if(lbl){lbl.textContent=target+' ms';lbl.style.left=tp+'%'}
   $('fillMs').textContent=Number.isFinite(fill)?Math.round(fill):fill;$('targetMs').textContent=target;const blm=$('bufLegMax');if(blm)blm.textContent=MAX+' ms';
-  $('tMode').textContent=status.runtime?.remote_host?'direct IP':(status.runtime?.remote_device_name?'cloud':'passive');$('tHost').textContent=status.runtime?.remote_host||'—';
-  $('dRtt').textContent=(stats.rtt_ms||0).toFixed(1)+' ms';$('dOwLat').textContent=(stats.one_way_latency_ms||0).toFixed(1)+' ms';
+  $('tMode').textContent=status.runtime?.remote_host?'direct IP':(status.runtime?.remote_device_name?'cloud':'passive');$('tHost').textContent=status.runtime?.remote_host||(status.discovered_peer_addr?status.discovered_peer_addr+' (via cloud)':'—');
+  function diagVal(id,text,cls){const el=$(id);if(!el)return;el.textContent=text;el.style.color=cls==='bad'?'var(--red)':cls==='warn'?'var(--orange)':'';}
+  diagVal('dRtt',(stats.rtt_ms||0).toFixed(1)+' ms','');
+  diagVal('dOwLat',(stats.one_way_latency_ms||0).toFixed(1)+' ms (RTT/2)','');
   const d=stats.drift_pressure_ppm||0;$('dDrift').textContent=(d>=0?'+':'')+d+' ppm';
   $('dFps').textContent=(stats.decoded_fps||0).toFixed(1);$('dTxFps').textContent=(stats.tx_fps||0).toFixed(1);
-  $('dQ').textContent=stats.queued_groups||0;$('dOv').textContent=stats.ring_overflows||0;
-  $('dPlc').textContent=stats.plc_channels||0;$('dMiss').textContent=stats.seq_missing||0;
+  $('dQ').textContent=stats.queued_groups||0;
+  diagVal('dOv',stats.ring_overflows||0,(stats.ring_overflows||0)>0?'warn':'');
+  diagVal('dPlc',stats.plc_channels||0,(stats.plc_channels||0)>0?'warn':'');
+  diagVal('dMiss',stats.seq_missing||0,(stats.seq_missing||0)>2?'bad':(stats.seq_missing||0)>0?'warn':'');
   $('dSug').textContent=stats.recommended_buffer_ms?stats.recommended_buffer_ms+' ms':'—';
-  $('dUf').textContent=stats.output_underflows||0;$('dUp').textContent=(status.uptime_seconds||0)+' s';
+  diagVal('dUf',stats.output_underflows||0,(stats.output_underflows||0)>0?'warn':'');
+  $('dUp').textContent=(status.uptime_seconds||0)+' s';
   renderMeters();updateSetupFromStatus();updateSignalLamps()}
 // ── Meters ───────────────────────────────────────────────────────────────────
 const DB_FLOOR=-60,DB_RANGE=60,DB_G=-18,DB_O=-10;
@@ -573,7 +582,12 @@ function buildMatrices(){
   const k=matrixKey();if(k===matrixLastKey){refreshTxColHeaders();updateSignalLamps();return}
   matrixLastKey=k;buildTxTable();buildRxTable()}
 // ── Audio devices ────────────────────────────────────────────────────────────
-function renderDevices(){$('devices').innerHTML=`<div class="devrow"><span class="dk">Sample rate</span><b>${devices.sample_rate||48000} Hz</b></div><div class="devrow"><span class="dk">Default input</span><b>${esc(devices.default_input||'none')}</b></div><div class="devrow"><span class="dk">Input channels</span><b>${devices.default_input_channels??0}</b></div><div class="devrow"><span class="dk">Default output</span><b>${esc(devices.default_output||'none')}</b></div><div class="devrow"><span class="dk">Output channels</span><b>${devices.default_output_channels??0}</b></div>`}
+function renderDevices(){
+  const el=id=>$(id);
+  if(el('inSampleRate')) el('inSampleRate').textContent=(devices.default_input_sample_rate||devices.sample_rate||48000)+' Hz';
+  if(el('inChannels')) el('inChannels').textContent=devices.default_input_channels??'—';
+  if(el('outSampleRate')) el('outSampleRate').textContent=(devices.default_output_sample_rate||devices.sample_rate||48000)+' Hz';
+  if(el('outChannels')) el('outChannels').textContent=devices.default_output_channels??'—';}
 // ── Interface + device dropdowns ────────────────────────────────────────────
 function populateInterfaces(ifaces){
   const sel=$('cfgInterface');if(!sel)return;
@@ -609,7 +623,17 @@ async function poll(){
   }catch(e){
     pollFailCount++;if(pollFailCount>=3)showOffline()}}
 // ── Init ─────────────────────────────────────────────────────────────────────
-fetch('/api/device-ip').then(r=>r.json()).then(d=>{$('deviceIpInput').value=d.ip||'unknown'}).catch(()=>{const el=$('deviceIpInput');if(el)el.value='unknown'});
+// Load persisted config to pre-populate setup fields before status arrives.
+// updateSetupFromStatus() only fills fields marked non-dirty, so this seeds
+// the values correctly without overriding anything the user has typed.
+fetch('/api/config').then(r=>r.json()).then(cfg=>{
+  const co=cfg.config||{};
+  if(co.remote_device_name&&!cfgDirty.remoteName)$('cfgRemoteName').value=co.remote_device_name;
+  if(co.remote&&!cfgDirty.peer)$('cfgPeer').value=co.remote;
+  if(co.bind_addr&&co.bind_addr!=='0.0.0.0'&&!cfgDirty.interface&&$('cfgInterface'))$('cfgInterface').value=co.bind_addr;
+  if(co.selected_input_device&&!cfgDirty.inputDevice&&$('cfgInputDevice'))$('cfgInputDevice').value=co.selected_input_device;
+  if(co.selected_output_device&&!cfgDirty.outputDevice&&$('cfgOutputDevice'))$('cfgOutputDevice').value=co.selected_output_device;
+}).catch(console.error);
 fetch('/api/audio/devices').then(r=>r.json()).then(d=>{devices=d;renderDevices();populateDeviceDropdowns(d)}).catch(console.error);
 fetch('/api/interfaces').then(r=>r.json()).then(populateInterfaces).catch(console.error);
 poll();setInterval(poll,200);
