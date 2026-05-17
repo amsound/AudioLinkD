@@ -190,7 +190,7 @@ pub fn peak_dbfs_from_peak(peak: f32) -> f32 {
 /// writes directly when cpal probes virtual backends during enumeration.
 /// The file descriptors are restored immediately after the call.
 #[cfg(target_os = "linux")]
-fn suppress_alsa_stderr<F: FnOnce() -> T, T>(f: F) -> T {
+pub fn suppress_alsa_stderr<F: FnOnce() -> T, T>(f: F) -> T {
     use std::os::unix::io::AsRawFd;
     let stderr_fd = std::io::stderr().as_raw_fd();
     let saved = unsafe { libc::dup(stderr_fd) };
@@ -204,7 +204,7 @@ fn suppress_alsa_stderr<F: FnOnce() -> T, T>(f: F) -> T {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn suppress_alsa_stderr<F: FnOnce() -> T, T>(f: F) -> T { f() }
+pub fn suppress_alsa_stderr<F: FnOnce() -> T, T>(f: F) -> T { f() }
 
 pub fn scan_audio_devices_once() -> DeviceResponse {
     suppress_alsa_stderr(|| scan_audio_devices_inner())

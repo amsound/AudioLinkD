@@ -12,7 +12,7 @@ mod engine;
 use anyhow::Result;
 
 use constants::*;
-use state::{EncoderMode, JitterConfig, MonitorMode};
+use state::{EncoderMode, JitterConfig};
 use packet::{
     default_node_id, derive_link_token, derive_token_from_text,
     parse_token_arg, token_to_hex,
