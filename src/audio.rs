@@ -185,8 +185,41 @@ pub fn peak_dbfs_from_peak(peak: f32) -> f32 {
 
 // ─── Device scanning ─────────────────────────────────────────────────────────
 
+/// Temporarily redirect stderr to /dev/null on Linux to suppress the wall of
+/// ALSA "cannot connect to JACK / PulseAudio / OSS" messages that libasound
+/// writes directly when cpal probes virtual backends during enumeration.
+/// The file descriptors are restored immediately after the call.
+#[cfg(target_os = "linux")]
+fn suppress_alsa_stderr<F: FnOnce() -> T, T>(f: F) -> T {
+    use std::os::unix::io::AsRawFd;
+    let stderr_fd = std::io::stderr().as_raw_fd();
+    let saved = unsafe { libc::dup(stderr_fd) };
+    if saved < 0 { return f(); }
+    if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        unsafe { libc::dup2(devnull.as_raw_fd(), stderr_fd); }
+    }
+    let result = f();
+    unsafe { libc::dup2(saved, stderr_fd); libc::close(saved); }
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn suppress_alsa_stderr<F: FnOnce() -> T, T>(f: F) -> T { f() }
+
 pub fn scan_audio_devices_once() -> DeviceResponse {
+    suppress_alsa_stderr(|| scan_audio_devices_inner())
+}
+
+fn scan_audio_devices_inner() -> DeviceResponse {
     let host = cpal::default_host();
+    // Force 48kHz on default devices before querying config —
+    // ensures the scan reflects the actual operating rate.
+    if let Some(d) = host.default_output_device() {
+        if let Ok(n) = d.name() { try_force_device_sample_rate(&n, SAMPLE_RATE); }
+    }
+    if let Some(d) = host.default_input_device() {
+        if let Ok(n) = d.name() { try_force_device_sample_rate(&n, SAMPLE_RATE); }
+    }
     let default_input_device  = host.default_input_device();
     let default_output_device = host.default_output_device();
     let default_input_channels = default_input_device.as_ref()

@@ -244,7 +244,6 @@ pub async fn setup_apply_handler(
         "--token".to_string(), token_hex.clone(),
         "--bitrate".to_string(), req.opus_bitrate_per_channel.to_string(),
         "--latency-ms".to_string(), receive_buffer_ms.to_string(),
-        "--monitor".to_string(), "matrix".to_string(),
     ];
     if !remote_device_name.is_empty() {
         args.insert(1, remote_device_name.to_string());
@@ -369,8 +368,10 @@ pub async fn streams_handler(State(state): State<WebState>) -> Json<serde_json::
     }))
 }
 
-pub async fn devices_handler(State(state): State<WebState>) -> Json<DeviceResponse> {
-    Json((*state.devices).clone())
+pub async fn devices_handler() -> Json<DeviceResponse> {
+    // Live scan on every request — reflects the actual current device state
+    // including any sample rate changes made by try_force_device_sample_rate().
+    Json(crate::audio::scan_audio_devices_once())
 }
 
 pub async fn config_handler() -> Json<crate::persistence::PersistedUiState> {
@@ -659,7 +660,7 @@ pub fn spawn_web_ui(addr: String, state: WebState) {
             let app = Router::new()
                 .route("/",                     get(index_handler))
                 .route("/api/status",           get(status_handler))
-                .route("/api/audio/devices",    get(devices_handler))
+                .route("/api/audio/devices",    get(devices_handler))  // live scan, no State needed
                 .route("/api/streams",          get(streams_handler).post(streams_handler))
                 .route("/api/peers",            get(peers_handler))
                 .route("/api/peers/connect",    post(status_handler))

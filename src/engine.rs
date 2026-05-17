@@ -354,6 +354,33 @@ pub fn run_bidir(
 
     let host = cpal::default_host();
 
+    // ── Audio hardware initialisation (runs before network starts) ────────────
+    // On Linux: suppress_alsa_stderr wraps all ALSA enumeration so the wall of
+    // "cannot connect to JACK/PulseAudio/OSS" messages from libasound doesn't
+    // flood the logs. Those messages are libasound probing virtual backends and
+    // are completely harmless — they go to stderr directly, bypassing tracing.
+    suppress_alsa_stderr(|| {
+        use cpal::traits::HostTrait;
+        let out_name = selected_output_device.as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
+            .or_else(|| host.default_output_device().and_then(|d| d.name().ok()));
+        let in_name = selected_input_device.as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
+            .or_else(|| host.default_input_device().and_then(|d| d.name().ok()));
+        if let Some(name) = out_name {
+            try_force_device_sample_rate(&name, SAMPLE_RATE);
+        }
+        if let Some(name) = in_name {
+            try_force_device_sample_rate(&name, SAMPLE_RATE);
+        }
+    });
+    // Small settle time for CoreAudio to apply the rate change before we
+    // open streams. 100ms is enough; the hardware switch is near-instant.
+    #[cfg(target_os = "macos")]
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
     // Helper: find a device by name, falling back to the default.
     // Used for both input and output selection.
     let find_output_device = |preferred: &Option<String>| -> Option<cpal::Device> {
@@ -387,13 +414,9 @@ pub fn run_bidir(
 
     // ── Receive / playback pipeline ─────────────────────────────────────────
     let _out_stream: Option<cpal::Stream> = if recv_enabled {
-        let out_device = find_output_device(&selected_output_device).ok_or_else(|| anyhow!("No output device"))?;
-        // On macOS: attempt to set the CoreAudio nominal rate to 48kHz before
-        // cpal opens the stream. This overrides Audio MIDI Setup.
-        if let Ok(name) = out_device.name() {
-            try_force_device_sample_rate(&name, SAMPLE_RATE);
-        }
-        let (out_config, out_device_rate) = best_output_config(&out_device, 2);
+        let out_device = suppress_alsa_stderr(|| find_output_device(&selected_output_device))
+            .ok_or_else(|| anyhow!("No output device"))?;
+        let (out_config, out_device_rate) = suppress_alsa_stderr(|| best_output_config(&out_device, 2));
         tracing::info!("Output: {} @ {}Hz stereo{}",
             out_device.name().unwrap_or_default(),
             out_device_rate,
@@ -1072,12 +1095,9 @@ pub fn run_bidir(
         let in_stream_opt = if in_channels > 0 {
             match host.default_input_device() {
                 Some(_default_dev) => {
-                    let in_dev = find_input_device(&selected_input_device)
+                    let in_dev = suppress_alsa_stderr(|| find_input_device(&selected_input_device))
                         .unwrap_or(_default_dev);
-                    if let Ok(name) = in_dev.name() {
-                        try_force_device_sample_rate(&name, SAMPLE_RATE);
-                    }
-                    let (in_cfg, in_device_rate) = best_input_config(&in_dev, in_channels);
+                    let (in_cfg, in_device_rate) = suppress_alsa_stderr(|| best_input_config(&in_dev, in_channels));
                     let actual_in_channels = in_cfg.channels as usize;
                     tracing::info!("Input: {} @ {}Hz {}ch{}",
                         in_dev.name()?, in_device_rate, actual_in_channels,
