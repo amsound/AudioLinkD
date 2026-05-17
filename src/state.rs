@@ -246,6 +246,8 @@ pub struct WebState {
     pub restart_lock: Arc<Mutex<()>>,
     pub established_peer_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
     pub rtt_us10: Arc<AtomicU32>,
+    pub actual_input_rate: Arc<AtomicU32>,
+    pub actual_output_rate: Arc<AtomicU32>,
     pub remote_conflict: Arc<Mutex<Option<String>>>,
 }
 

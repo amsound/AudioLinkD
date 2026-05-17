@@ -186,6 +186,8 @@ pub fn run_bidir(
         restart_lock: Arc::new(Mutex::new(())),
         established_peer_addr: Arc::clone(&established_addr),
         rtt_us10: Arc::clone(&rtt_us10),
+        actual_input_rate: Arc::new(AtomicU32::new(0)),
+        actual_output_rate: Arc::new(AtomicU32::new(0)),
         remote_conflict: Arc::clone(&remote_conflict),
     };
 
@@ -421,6 +423,8 @@ pub fn run_bidir(
             out_device.name().unwrap_or_default(),
             out_device_rate,
             if out_device_rate != SAMPLE_RATE { " (resampling from 48kHz)" } else { "" });
+        // Expose actual negotiated rate to the web UI
+        web_state.actual_output_rate.store(out_device_rate, Ordering::Relaxed);
 
         let prime_samples = ((jitter.target_delay_ms as usize * SAMPLE_RATE as usize) / 1000)
             .max(PRIME_SAMPLES);
@@ -1102,6 +1106,8 @@ pub fn run_bidir(
                     tracing::info!("Input: {} @ {}Hz {}ch{}",
                         in_dev.name()?, in_device_rate, actual_in_channels,
                         if in_device_rate != SAMPLE_RATE { " (resampling to 48kHz)" } else { "" });
+                    // Expose actual negotiated rate to the web UI
+                    web_state.actual_input_rate.store(in_device_rate, Ordering::Relaxed);
                     // Build a resampler if the device doesn't run at 48kHz
                     let mut in_resampler = make_io_resampler(in_device_rate, SAMPLE_RATE);
                     let rings_cb  = Arc::clone(&input_rings);

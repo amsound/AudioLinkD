@@ -29,7 +29,7 @@ use crate::routing::{
     apply_routes_to_masks, apply_routes_to_tx_sources, matrix_for_state,
     load_persisted_routes, tx_source_sample, source_code_from_bit_index,
 };
-use crate::audio::{peak_dbfs_from_peak, scan_audio_devices_once, sleep_until, ALSA_PERIOD};
+use crate::audio::{peak_dbfs_from_peak, scan_audio_devices_once, sleep_until, suppress_alsa_stderr, ALSA_PERIOD};
 use crate::interfaces::{list_network_interfaces, NetworkInterface};
 use crate::jitter::effective_receive_buffer_ms;
 
@@ -368,10 +368,15 @@ pub async fn streams_handler(State(state): State<WebState>) -> Json<serde_json::
     }))
 }
 
-pub async fn devices_handler() -> Json<DeviceResponse> {
-    // Live scan on every request — reflects the actual current device state
-    // including any sample rate changes made by try_force_device_sample_rate().
-    Json(crate::audio::scan_audio_devices_once())
+pub async fn devices_handler(State(state): State<WebState>) -> Json<DeviceResponse> {
+    // Live scan for device lists, but use actual negotiated rates from the
+    // running engine (0 = engine not started yet, fall back to scanned value).
+    let mut info = suppress_alsa_stderr(crate::audio::scan_audio_devices_once);
+    let actual_in  = state.actual_input_rate.load(Ordering::Relaxed);
+    let actual_out = state.actual_output_rate.load(Ordering::Relaxed);
+    if actual_in  > 0 { info.default_input_sample_rate  = actual_in; }
+    if actual_out > 0 { info.default_output_sample_rate = actual_out; }
+    Json(info)
 }
 
 pub async fn config_handler() -> Json<crate::persistence::PersistedUiState> {
@@ -642,6 +647,8 @@ pub fn control_web_state(
         restart_lock: Arc::new(Mutex::new(())),
         established_peer_addr: Arc::new(Mutex::new(None)),
         rtt_us10: Arc::new(AtomicU32::new(0)),
+        actual_input_rate: Arc::new(AtomicU32::new(0)),
+        actual_output_rate: Arc::new(AtomicU32::new(0)),
         remote_conflict: Arc::new(Mutex::new(None)),
     };
     spawn_control_only_metering(&state);
@@ -660,7 +667,7 @@ pub fn spawn_web_ui(addr: String, state: WebState) {
             let app = Router::new()
                 .route("/",                     get(index_handler))
                 .route("/api/status",           get(status_handler))
-                .route("/api/audio/devices",    get(devices_handler))  // live scan, no State needed
+                .route("/api/audio/devices",    get(devices_handler))
                 .route("/api/streams",          get(streams_handler).post(streams_handler))
                 .route("/api/peers",            get(peers_handler))
                 .route("/api/peers/connect",    post(status_handler))
