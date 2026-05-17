@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AudioLink Control</title>
+<style>
+:root{--bg:#0d1117;--panel:#161c24;--panel2:#1c2430;--ink:#e2eaf2;--muted:#7e8fa0;--line:#252f3a;--cell:#1a2430;--green:#1dba5b;--orange:#f0a030;--red:#e04040;--blue:#4d9fff;--blue2:#1e5fa0;--hbg:#090d12;--hborder:#1e2830;--nbg:#0f141a;--logo:#e8eef4;--htext:#7e8fa0;--mono:'JetBrains Mono','Fira Code','Cascadia Code',monospace}
+body.light{--bg:#f0f3f7;--panel:#fff;--panel2:#e6eaf0;--ink:#111820;--muted:#6b7a8d;--line:#ccd3de;--cell:#dde3ec;--blue2:#1858a8;--hbg:#fff;--hborder:#ccd3de;--nbg:#f5f7fa;--logo:#111820;--htext:#5a6a7a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font:13.5px/1.5 'IBM Plex Sans','Segoe UI',system-ui,sans-serif;transition:background .2s,color .2s}
+input,select,button{font:inherit;background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:7px 10px;transition:background .2s,color .2s,border-color .2s}
+input:focus,select:focus{outline:2px solid var(--blue);outline-offset:1px;border-color:transparent}
+button{cursor:pointer}
+header{display:flex;align-items:center;justify-content:space-between;padding:11px 20px;border-bottom:1px solid var(--hborder);background:var(--hbg);position:sticky;top:0;z-index:20;gap:10px;transition:background .2s,border-color .2s}
+.logo{font-size:15px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--logo);flex-shrink:0;transition:color .2s}
+.logo span{color:var(--blue)}
+.nodeline{color:var(--htext);font-size:11px;margin-top:2px;font-family:var(--mono);transition:color .2s}
+.hright{display:flex;align-items:center;gap:9px;flex-shrink:0}
+.theme-btn{background:transparent;border:1px solid var(--hborder);border-radius:16px;padding:4px 10px;font-size:11px;color:var(--htext);transition:border-color .2s,color .2s}
+.theme-btn:hover{border-color:var(--muted);color:var(--ink)}
+.conn-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:18px;font-size:12px;font-weight:600;border:1px solid;white-space:nowrap}
+.conn-badge.green{background:rgba(29,186,91,.1);border-color:rgba(29,186,91,.4);color:#3ed47a}
+.conn-badge.orange{background:rgba(240,160,48,.1);border-color:rgba(240,160,48,.4);color:#e8920a}
+.conn-badge.gray{background:rgba(100,120,140,.07);border-color:rgba(100,120,140,.22);color:var(--muted)}
+.lamp{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.lamp.green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.lamp.orange{background:var(--orange);box-shadow:0 0 6px var(--orange)}
+.lamp.gray{background:#3a4a5a}
+body.light .lamp.gray{background:#a0b0c0}
+nav{display:flex;gap:5px;padding:8px 20px;background:var(--nbg);border-bottom:1px solid var(--line);position:sticky;top:51px;z-index:19;overflow-x:auto;transition:background .2s,border-color .2s}
+.tab{padding:5px 13px;border-radius:7px;font-size:13px;font-weight:500;border:1px solid transparent;background:transparent;color:var(--muted);white-space:nowrap;transition:.12s}
+.tab:hover{color:var(--ink);background:var(--panel)}
+.tab.active{background:var(--blue2);color:#c8e0ff;border-color:rgba(77,159,255,.28)}
+body.light .tab.active{color:#fff}
+.alertbar{display:none;padding:8px 20px;font-size:12px;font-weight:700;letter-spacing:.04em;text-align:center}
+.alertbar.show{display:block}
+.alertbar.offline{background:#6e1010;color:#ffc8c8}
+.alertbar.degraded{background:#6a3c08;color:#ffd8a0}
+main{padding:16px 20px;max-width:1400px;margin:auto}
+.page{display:none}.page.active{display:block}
+.mb{margin-bottom:13px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:15px;transition:background .2s,border-color .2s}
+.ctitle{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:13px}
+@media(max-width:700px){.g2{grid-template-columns:1fr}}
+.link-ov{display:grid;grid-template-columns:1fr 1px 1fr;gap:16px;align-items:start}
+.node-col{display:flex;flex-direction:column;gap:5px}
+.nname{font-size:19px;font-weight:700;font-family:var(--mono)}
+.nsub-chip{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:2px 7px;font-size:11px;color:var(--muted);white-space:nowrap}
+.nsub-chip.live{color:var(--green);border-color:rgba(29,186,91,.3)}
+.divv{background:var(--line);min-height:60px;align-self:stretch}
+.statgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:13px}
+@media(max-width:780px){.statgrid{grid-template-columns:repeat(3,1fr)}}
+.stile{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 13px;transition:background .2s}
+.slbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px}
+.sval{font-size:20px;font-weight:700;font-family:var(--mono);line-height:1}
+.sval.ok{color:var(--green)}.sval.warn{color:var(--orange)}.sval.bad{color:var(--red)}.sval.dim{color:var(--ink)}
+.sval .u{font-size:12px;font-weight:400;color:var(--muted)}
+.bufrow{display:flex;align-items:baseline;gap:8px;margin-bottom:9px}
+.bufms{font-size:22px;font-weight:700;font-family:var(--mono)}
+.bufmeta{font-size:12px;color:var(--muted)}
+.buftrack{height:10px;background:var(--bg);border-radius:5px;position:relative;border:1px solid var(--line);overflow:visible;transition:background .2s}
+.buffill{height:100%;border-radius:5px;background:var(--green);transition:width .22s ease}
+.buffill.warn{background:var(--orange)}.buffill.bad{background:var(--red)}
+.buftick{position:absolute;top:-4px;bottom:-4px;width:2px;background:rgba(128,160,180,.5);border-radius:2px}
+.bufleg{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-top:4px}
+details{margin-top:9px}
+details summary{cursor:pointer;list-style:none;font-size:12px;color:var(--blue);padding:4px 0;display:flex;align-items:center;gap:5px;user-select:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:'›';font-size:15px;transition:.12s;display:inline-block;width:12px}
+details[open] summary::before{transform:rotate(90deg)}
+.dkv{display:grid;grid-template-columns:1fr 1fr;gap:5px 13px;padding:10px;background:var(--bg);border-radius:8px;margin-top:5px;border:1px solid var(--line);font-size:12px;transition:background .2s}
+.dkv .k{color:var(--muted)}.dkv .v{font-family:var(--mono);font-size:11px}
+.mbank{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-end;padding:4px 0}
+.meter{display:flex;flex-direction:column;align-items:center;gap:5px;flex-shrink:0}
+.bartrack{width:22px;height:220px;position:relative;border-radius:3px;border:1px solid var(--line);overflow:hidden;background:var(--bg);transition:background .2s,border-color .2s}
+.bartrack::after{content:'';position:absolute;inset:0;pointer-events:none;z-index:3;background:linear-gradient(to top,transparent calc(70% - .5px),rgba(255,255,255,.2) calc(70% - .5px),rgba(255,255,255,.2) calc(70% + .5px),transparent calc(70% + .5px)),linear-gradient(to top,transparent calc(83.3% - .5px),rgba(255,255,255,.15) calc(83.3% - .5px),rgba(255,255,255,.15) calc(83.3% + .5px),transparent calc(83.3% + .5px))}body.light .bartrack::after{background:linear-gradient(to top,transparent calc(70% - .5px),rgba(0,0,0,.25) calc(70% - .5px),rgba(0,0,0,.25) calc(70% + .5px),transparent calc(70% + .5px)),linear-gradient(to top,transparent calc(83.3% - .5px),rgba(0,0,0,.2) calc(83.3% - .5px),rgba(0,0,0,.2) calc(83.3% + .5px),transparent calc(83.3% + .5px))}
+.sg,.so,.sr{position:absolute;left:0;right:0;transition:height .05s linear,bottom .05s linear}
+.sg{background:var(--green);bottom:0;z-index:1}.so{background:var(--orange);z-index:2}.sr{background:var(--red);z-index:2}
+.barticks{position:absolute;right:calc(100% + 5px);top:0;bottom:0;width:26px;pointer-events:none}
+.tlbl{position:absolute;font-size:9px;color:var(--muted);right:0;transform:translateY(-50%);font-family:var(--mono);line-height:1;white-space:nowrap}
+.tlbl.hi{color:var(--ink)}
+.mdb{font-family:var(--mono);font-size:10px;color:var(--muted);width:40px;text-align:center}
+.mlbl{font-size:10px;color:var(--muted);text-align:center;width:44px;line-height:1.3}
+.page.routing{margin:-16px -20px 0}
+.route-toolbar{display:flex;align-items:center;gap:10px;padding:9px 20px;background:var(--nbg);border-bottom:1px solid var(--line);transition:background .2s}
+.route-btn{padding:5px 14px;font-size:12px;font-weight:600;background:var(--panel);border:1px solid var(--line);border-radius:7px;color:var(--muted);transition:color .15s,border-color .15s,background .15s}
+.route-btn:hover{color:var(--ink);border-color:var(--muted)}
+.route-btn.arm{background:rgba(224,64,64,.1);border-color:rgba(224,64,64,.5);color:var(--red);animation:armPulse .25s ease}
+@keyframes armPulse{from{transform:scale(1.04)}to{transform:scale(1)}}
+.matrix-outer{overflow:auto;max-height:calc(100vh - 148px);border-bottom:1px solid var(--line)}
+table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
+.mx th,.mx td{border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+.mx td.rh,.mx th.rh{position:sticky;left:0;z-index:2;background:var(--panel2);width:230px;min-width:230px;padding:0;transition:background .2s}
+.mx thead th.rh{z-index:5;top:0}
+.mx thead th:not(.rh){position:sticky;top:0;z-index:3;background:var(--panel2);width:60px;min-width:60px;max-width:60px;padding:0;vertical-align:bottom;transition:background .2s}
+.ch-hdr{display:flex;flex-direction:column;align-items:center;padding:6px 2px 5px;gap:2px;min-height:56px;justify-content:flex-end}
+.ch-hdr-num{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.04em}
+.ch-hdr-lbl{font-size:11px;color:var(--ink);font-weight:600;width:56px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:center;min-height:12px}
+.src-row{display:flex;align-items:center;gap:5px;padding:0 8px;height:36px;white-space:nowrap;overflow:hidden}
+.rsig{display:inline-block;width:7px;height:7px;border-radius:50%;background:#2e3e4e;flex-shrink:0;transition:background .15s}
+.rsig.green{background:var(--green);box-shadow:0 0 4px var(--green)}
+.rsig.orange{background:var(--orange)}
+.rsig.red{background:var(--red)}
+.src-sysname{font-size:13px;font-weight:600;flex-shrink:0;overflow:hidden;text-overflow:ellipsis}
+.src-sep{color:var(--muted);font-size:11px;flex-shrink:0}
+.src-label-input{flex:1;min-width:40px;max-width:120px;padding:1px 5px;font-size:11px;font-weight:600;background:transparent;border:1px solid transparent;border-radius:5px;color:var(--ink);transition:border-color .12s,background .12s}
+.src-label-input:focus{background:var(--panel);border-color:var(--blue);outline:none}
+.src-label-input.dirty{border-color:var(--orange)}
+.src-label-input::placeholder{color:var(--line)}
+.mx tr.src-spacer td{height:10px;background:var(--bg);border-right:none;pointer-events:none}
+.mx tr.src-spacer td.rh{background:var(--bg)}
+.xcell{width:60px;min-width:60px;max-width:60px;height:60px;background:var(--cell);cursor:pointer;padding:0;transition:filter .06s}
+.xcell.on{background:var(--green)}
+.mx tr.hl-row > .rh{background:rgba(77,159,255,.12)!important}
+.mx tr.hl-row > .xcell:not(.on){background:rgba(77,159,255,.10)!important}
+.mx td.hl-col.xcell:not(.on){background:rgba(77,159,255,.08)!important}
+.mx th.hl-col{background:rgba(77,159,255,.08)!important}
+.mx tr.hl-row > td.hl-col.xcell:not(.on){background:rgba(77,159,255,.20)!important}
+.mx .xcell.on.hl-col,.mx tr.hl-row > .xcell.on{filter:brightness(1.3)}
+.sgrid{display:grid;grid-template-columns:1fr 1fr;gap:13px;align-items:start}
+@media(max-width:860px){.sgrid{grid-template-columns:1fr}}
+.field{display:grid;gap:5px;margin-bottom:10px}
+.field label{font-size:12px;font-weight:600}
+.hint{font-weight:400;color:var(--muted)}
+.field input,.field select{width:100%}
+.idrow{display:flex;gap:6px}
+.idrow input{flex:1;font-family:var(--mono);font-size:13px;font-weight:600}
+.cpybtn{padding:7px 10px;font-size:12px;background:var(--panel2);border-color:var(--line);white-space:nowrap;flex-shrink:0}
+.savebtn{padding:7px 10px;font-size:12px;background:var(--blue2);border-color:rgba(77,159,255,.38);color:#c8e0ff;white-space:nowrap;flex-shrink:0;display:none}
+.savebtn.show{display:inline-block}
+.mpill{display:inline-flex;align-items:center;gap:7px;padding:6px 13px;border-radius:18px;font-size:12px;font-weight:700;border:1px solid;transition:.2s;margin-top:11px}
+.mpill.rdv{background:rgba(77,159,255,.09);border-color:rgba(77,159,255,.32);color:#5ab0f0}
+.mpill.dir{background:rgba(29,186,91,.09);border-color:rgba(29,186,91,.32);color:#3dcc72}
+.mpill.pas{background:rgba(100,120,140,.06);border-color:rgba(100,120,140,.22);color:var(--muted)}
+.mdot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:currentColor}
+.crow{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--line)}
+.crow:last-child{border-bottom:none}
+.ck{font-size:12px;color:var(--muted)}
+.cv select{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px}
+.cv input[type=checkbox]{width:auto;margin:0;accent-color:var(--green)}
+.applybtn{width:100%;padding:8px 11px;margin-top:10px;background:var(--blue2);border-color:rgba(77,159,255,.38);color:#c8e0ff;font-size:12px;font-weight:600;border-radius:8px;transition:background .15s,border-color .15s,color .15s}
+.applybtn:hover{background:#2870c4}
+.applybtn.arm{background:rgba(224,64,64,.14);border-color:rgba(224,64,64,.5);color:var(--red)}
+.applybtn.done{background:rgba(29,186,91,.14);border-color:rgba(29,186,91,.4);color:var(--green);cursor:default}
+.devrow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}
+.devrow:last-child{border-bottom:none}
+.dk{color:var(--muted)}
+.card-divider{border:none;border-top:1px solid var(--line);margin:12px 0}
+</style>
+</head>
+<body>
+<div id="alertbar" class="alertbar offline show">REMOTE DEVICE OFFLINE</div>
+<header>
+  <div><div class="logo">Audio<span>Link</span></div><div class="nodeline" id="nodeLine">Starting…</div></div>
+  <div class="hright">
+    <button class="theme-btn" id="themeBtn" onclick="toggleTheme()"></button>
+    <div id="connBadge" class="conn-badge gray"><span class="lamp gray" id="peerLamp"></span><span id="peerText">No connected device</span></div>
+  </div>
+</header>
+<nav>
+  <button class="tab active" data-page="home">Home</button>
+  <button class="tab" data-page="txrouting">Send Routing</button>
+  <button class="tab" data-page="rxrouting">Receive Routing</button>
+  <button class="tab" data-page="meters">Meters</button>
+  <button class="tab" data-page="setup">Setup</button>
+</nav>
+<main>
+<section id="home" class="page active">
+  <div class="card mb">
+    <div class="ctitle">Link</div>
+    <div class="link-ov">
+      <div class="node-col">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">This device</div>
+        <div class="nname" id="localName">—</div>
+        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px">
+          <span class="nsub-chip" id="localCh">—</span>
+          <span class="nsub-chip" id="localBr">—</span>
+          <span class="nsub-chip" id="localCodec">music</span>
+          <span class="nsub-chip" id="localPl">phase lock</span>
+        </div>
+      </div>
+      <div class="divv"></div>
+      <div class="node-col">
+        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">Remote device</div>
+        <div class="nname" id="remoteNameHome" style="color:var(--muted)">—</div>
+        <div id="remoteChips" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px"></div>
+      </div>
+    </div>
+  </div>
+  <div class="statgrid">
+    <div class="stile"><div class="slbl">One-way latency</div><div class="sval ok" id="owVal">—<span class="u"> ms</span></div></div>
+    <div class="stile"><div class="slbl">TX</div><div class="sval dim"><span id="txBw">—</span><span class="u"> Mb/s</span></div></div>
+    <div class="stile"><div class="slbl">RX</div><div class="sval dim"><span id="rxBw">—</span><span class="u"> Mb/s</span></div></div>
+    <div class="stile"><div class="slbl">Packet loss</div><div class="sval ok" id="lossVal">—<span class="u"> %</span></div></div>
+    <div class="stile"><div class="slbl">Jitter EMA</div><div class="sval ok" id="jitterVal">—<span class="u"> ms</span></div></div>
+  </div>
+  <div class="card mb">
+    <div class="ctitle">Incoming Buffer</div>
+    <div class="bufrow"><span class="bufms" id="fillMs">—</span><span class="bufmeta">ms · target <b id="targetMs" style="color:var(--ink)">—</b> ms</span></div>
+    <div class="buftrack"><div class="buffill" id="bufFill" style="width:0"></div><div class="buftick" id="bufTick" style="left:100%"></div></div>
+    <div class="bufleg" id="bufLeg" style="position:relative;height:14px"><span style="position:absolute;left:0">0</span><span id="bufTickLbl" style="position:absolute;transform:translateX(-50%)">—</span><span id="bufLegMax" style="position:absolute;right:0">— ms</span></div>
+  </div>
+  <div class="card">
+    <div class="ctitle">Transport</div>
+    <div style="font-size:13px;color:var(--muted)">
+      <div>Mode: <b id="tMode" style="color:var(--ink)">—</b></div>
+      <div>Remote host: <b id="tHost" style="color:var(--ink)">—</b></div>
+    </div>
+    <details>
+      <summary>Diagnostics</summary>
+      <div class="dkv">
+        <span class="k">RTT</span><span class="v" id="dRtt">—</span>
+        <span class="k">One-way est.</span><span class="v" id="dOwLat">—</span>
+        <span class="k">Clock drift</span><span class="v" id="dDrift">—</span>
+        <span class="k">Decoded fps</span><span class="v" id="dFps">—</span>
+        <span class="k">TX fps</span><span class="v" id="dTxFps">—</span>
+        <span class="k">Queued groups</span><span class="v" id="dQ">—</span>
+        <span class="k">Ring overflows</span><span class="v" id="dOv">—</span>
+        <span class="k">PLC channels</span><span class="v" id="dPlc">—</span>
+        <span class="k">Seq missing</span><span class="v" id="dMiss">—</span>
+        <span class="k">Suggested buffer</span><span class="v" id="dSug">—</span>
+        <span class="k">Underflows</span><span class="v" id="dUf">—</span>
+        <span class="k">Uptime</span><span class="v" id="dUp">—</span>
+      </div>
+    </details>
+  </div>
+</section>
+<section id="txrouting" class="page routing">
+  <div class="route-toolbar">
+    <button class="route-btn" id="txBtn1to1" onclick="routeConfirm('txBtn1to1',doTx1to1)">1:1</button>
+    <button class="route-btn" id="txBtnClear" onclick="routeConfirm('txBtnClear',doTxClear)">Clear all</button>
+    <button class="route-btn" id="txBtnResetLabels" onclick="routeConfirm('txBtnResetLabels',doResetLabels)" style="margin-left:auto">Reset labels</button>
+  </div>
+  <div class="matrix-outer"><table class="mx" id="txTable"><thead id="txHead"></thead><tbody id="txBody"></tbody></table></div>
+</section>
+<section id="rxrouting" class="page routing">
+  <div class="route-toolbar">
+    <button class="route-btn" id="rxBtn1to1" onclick="routeConfirm('rxBtn1to1',doRx1to1)">1:1</button>
+    <button class="route-btn" id="rxBtnClear" onclick="routeConfirm('rxBtnClear',doRxClear)">Clear all</button>
+  </div>
+  <div class="matrix-outer"><table class="mx" id="rxTable"><thead id="rxHead"></thead><tbody id="rxBody"></tbody></table></div>
+</section>
+<section id="meters" class="page">
+  <div class="card mb"><div class="ctitle">Send</div><div class="mbank" id="txMeters"></div></div>
+  <div class="card mb"><div class="ctitle">Receive</div><div class="mbank" id="rxMeters"></div></div>
+  <div class="card"><div class="ctitle">Output</div><div class="mbank" id="monMeters"></div></div>
+</section>
+<section id="setup" class="page">
+  <div class="sgrid mb">
+    <div class="card">
+      <div class="ctitle">This Node</div>
+      <div class="field">
+        <label>Device name</label>
+        <div class="idrow">
+          <input id="cfgNode" autocomplete="off" spellcheck="false" oninput="nodeNameDirty()">
+          <button class="cpybtn" onclick="copyFeedback(this,$('cfgNode').value)">Copy</button>
+          <button class="savebtn" id="nodeNameSave" onclick="saveNodeName()">Save</button>
+        </div>
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label>Device IP</label>
+        <div class="idrow">
+          <input id="deviceIpInput" readonly style="flex:1;color:var(--muted)">
+          <button class="cpybtn" onclick="copyFeedback(this,$('deviceIpInput').value)">Copy</button>
+        </div>
+      </div>
+      <hr class="card-divider">
+      <div class="field" style="margin-bottom:0">
+        <label>Network interface <span class="hint">— bind address for UDP</span></label>
+        <select id="cfgInterface" onchange="cfgDirty.interface=true" style="width:100%">
+          <option value="">Any (0.0.0.0)</option>
+        </select>
+      </div>
+    </div>
+    <div class="card">
+      <div class="ctitle">Connect To</div>
+      <div class="field"><label>Remote device name</label><input id="cfgRemoteName" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.remoteName=true" style="font-family:var(--mono);font-size:13px;font-weight:600"></div>
+      <div class="field" style="margin-bottom:0"><label>Remote IP</label><input id="cfgPeer" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.peer=true" style="font-family:var(--mono);font-size:13px;font-weight:600"></div>
+    </div>
+  </div>
+  <div class="sgrid mb" style="align-items:stretch">
+    <div class="card">
+      <div class="ctitle">Codec &amp; Transport</div>
+      <div class="crow"><span class="ck">Network send channels</span><span class="cv"><select id="cfgChannels" onchange="cfgDirty.channels=true"><option>1</option><option>2</option><option>4</option><option>6</option><option>8</option><option>16</option><option>24</option><option>32</option><option>40</option><option>64</option></select></span></div>
+      <div class="crow"><span class="ck">Bitrate per channel</span><span class="cv"><select id="bitrate" onchange="cfgDirty.bitrate=true"><option value="32000">32 kb/s</option><option value="48000">48 kb/s</option><option value="64000">64 kb/s</option><option value="96000">96 kb/s</option><option value="128000">128 kb/s</option><option value="192000">192 kb/s</option><option value="256000">256 kb/s</option></select></span></div>
+      <div class="crow"><span class="ck">Incoming buffer</span><span class="cv"><select id="rxBuffer" onchange="cfgDirty.rxBuffer=true"><option value="5">5 ms</option><option value="20">20 ms</option><option value="40">40 ms</option><option value="60">60 ms</option><option value="80">80 ms</option><option value="100">100 ms</option><option value="120">120 ms</option><option value="160">160 ms</option><option value="200">200 ms</option><option value="300">300 ms</option><option value="500">500 ms</option><option value="1000">1 s</option><option value="2000">2 s</option></select></span></div>
+      <div class="crow"><span class="ck">Encoder</span><span class="cv"><select id="cfgEncoderMode" onchange="cfgDirty.encoderMode=true"><option value="music">Music</option><option value="speech">Voice</option></select></span></div>
+      <div class="crow"><span class="ck">Phase lock</span><span class="cv"><input type="checkbox" id="cfgPhaseLock" checked onchange="cfgDirty.phaseLock=true"></span></div>
+      <button class="applybtn" id="applyBtn" onclick="applySetup()">Apply &amp; rebuild engine</button>
+    </div>
+    <div class="card">
+      <div class="ctitle">Advanced</div>
+      <div id="modePill" class="mpill rdv" style="margin-top:0;margin-bottom:14px"><span class="mdot"></span><span id="modeLabel">Cloud</span></div>
+      <div class="field">
+        <label>Link password</label>
+        <div style="display:flex;gap:6px"><input id="cfgLinkPw" type="password" style="flex:1" oninput="cfgDirty.linkPw=true"><button id="pwToggleBtn" onclick="togglePw()" style="padding:7px 12px;flex-shrink:0;min-width:52px">Show</button></div>
+      </div>
+      <div class="field"><label>Token override</label><input id="cfgToken" autocomplete="off" spellcheck="false"></div>
+      <div class="field" style="margin-bottom:0"><label>Rendezvous server</label><input id="cfgRendezvous" value="https://audiolink.amsound.co.uk" autocomplete="off" oninput="cfgDirty.rendezvous=true"></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="ctitle">Audio Devices</div>
+    <div id="devices"><div style="color:var(--muted);font-size:12px">Loading…</div></div>
+    <hr class="card-divider">
+    <div class="sgrid" style="gap:10px;margin-top:4px">
+      <div class="field" style="margin-bottom:0">
+        <label>Input device</label>
+        <select id="cfgInputDevice" onchange="cfgDirty.inputDevice=true" style="width:100%">
+          <option value="">Default</option>
+        </select>
+      </div>
+      <div class="field" style="margin-bottom:0">
+        <label>Output device</label>
+        <select id="cfgOutputDevice" onchange="cfgDirty.outputDevice=true" style="width:100%">
+          <option value="">Default</option>
+        </select>
+      </div>
+    </div>
+  </div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// Tab routing
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab,.page').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.page).classList.add('active')});
+// Theme
+const mq=window.matchMedia('(prefers-color-scheme: dark)');
+let dark;
+function applyTheme(isDark,save){dark=isDark;document.body.classList.toggle('light',!isDark);$('themeBtn').textContent=isDark?'☀ Light':'☾ Dark';if(save)localStorage.setItem('al-theme',isDark?'dark':'light')}
+const savedTheme=localStorage.getItem('al-theme');
+applyTheme(savedTheme?savedTheme==='dark':mq.matches,false);
+mq.addEventListener('change',e=>{if(!localStorage.getItem('al-theme'))applyTheme(e.matches,false)});
+function toggleTheme(){applyTheme(!dark,true)}
+// App state
+let status={},stats={},matrix={sources:[],destinations:[],routes:[]},devices={};
+let cfgDirty={};
+let savedNodeName='';
+let matrixLastKey='';
+let routeBusy=false;
+const armTimers={};
+// srcUserLabels: user-assigned labels keyed by source endpoint id e.g. "input:0"
+// This is the source of truth on the client. Persists across matrix rebuilds.
+const srcUserLabels={};
+// Helpers
+function setSelectValue(id,value){const el=$(id);if(!el)return;const v=String(value);if([...el.options].some(o=>o.value===v||o.text===v))el.value=v}
+function copyFeedback(btn,text){function done(){btn.textContent='Copied!';setTimeout(()=>btn.textContent='Copy',1800)}function fail(){btn.textContent='Failed';setTimeout(()=>btn.textContent='Copy',1800)}function execCopy(){try{const t=document.createElement('textarea');t.value=text;t.style.cssText='position:fixed;opacity:0;top:0;left:0';document.body.appendChild(t);t.focus();t.select();document.execCommand('copy');document.body.removeChild(t);done()}catch(e){fail()}}if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(text).then(done).catch(execCopy)}else{execCopy()}}
+function rttCls(ms){return ms>100?'bad':ms>40?'warn':'ok'}
+function lossCls(p){return p>2?'bad':p>.5?'warn':'ok'}
+// Double-tap confirm
+function routeConfirm(btnId,action){if(armTimers[btnId]){clearTimeout(armTimers[btnId]);delete armTimers[btnId];$(btnId).classList.remove('arm');action()}else{$(btnId).classList.add('arm');armTimers[btnId]=setTimeout(()=>{$(btnId).classList.remove('arm');delete armTimers[btnId]},3000)}}
+// Setup
+function updateMode(){const ip=($('cfgPeer').value||'').trim(),nm=($('cfgRemoteName').value||'').trim(),p=$('modePill'),l=$('modeLabel');if(ip){p.className='mpill dir';l.textContent='Direct IP'}else if(nm){p.className='mpill rdv';l.textContent='Cloud'}else{p.className='mpill pas';l.textContent='Passive'}}
+function nodeNameDirty(){cfgDirty.node=true;$('nodeNameSave').classList.toggle('show',$('cfgNode').value!==savedNodeName)}
+function saveNodeName(){const n=$('cfgNode').value.trim();if(!n)return;savedNodeName=n;$('nodeNameSave').classList.remove('show');$('nodeLine').textContent=n}
+function togglePw(){const f=$('cfgLinkPw'),b=$('pwToggleBtn');f.type=f.type==='password'?'text':'password';b.textContent=f.type==='password'?'Show':'Hide'}
+async function applySetup(){const btn=$('applyBtn');if(btn.classList.contains('done'))return;if(btn.classList.contains('arm')){clearTimeout(btn._armTimer);btn.classList.remove('arm');btn.disabled=true;btn.textContent='Rebuilding…';const body={remote:$('cfgPeer').value||'',remote_device_name:$('cfgRemoteName').value||'',link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value||savedNodeName,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value)||2,opus_bitrate_per_channel:Number($('bitrate').value)||128000,receive_buffer_ms:Number($('rxBuffer').value)||120,rendezvous_url:$('cfgRendezvous').value||undefined,phase_lock:$('cfgPhaseLock').checked,encoder_mode:$('cfgEncoderMode').value,bind_addr:$('cfgInterface').value||'0.0.0.0',selected_input_device:$('cfgInputDevice').value||undefined,selected_output_device:$('cfgOutputDevice').value||undefined};try{const res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const txt=await res.text();if(res.ok){btn.textContent='✓ Engine rebuilding';btn.classList.add('done');btn.disabled=false;setTimeout(()=>{btn.classList.remove('done');btn.textContent='Apply & rebuild engine'},3000)}else{btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+txt)}}catch(e){btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+e)}}else{btn.classList.add('arm');btn.textContent='Confirm rebuild';btn._armTimer=setTimeout(()=>{btn.classList.remove('arm');btn.textContent='Apply & rebuild engine'},3000)}}
+function updateSetupFromStatus(){if(!cfgDirty.node){$('cfgNode').value=status.node_id||'';if(!savedNodeName)savedNodeName=status.node_id||''}if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];if(!cfgDirty.rendezvous)$('cfgRendezvous').value=status.runtime?.rendezvous_url||'https://audiolink.amsound.co.uk';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels||2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel||128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms||120);if(!cfgDirty.encoderMode)setSelectValue('cfgEncoderMode',status.runtime?.encoder_mode||'music');if(!cfgDirty.phaseLock){const pl=$('cfgPhaseLock');if(pl)pl.checked=status.runtime?.phase_lock!==false}
+  if(!cfgDirty.interface){const s=$('cfgInterface');if(s){const v=status.runtime?.bind_addr||'';if(v&&v!=='0.0.0.0')s.value=v;else s.value=''}}
+  if(!cfgDirty.inputDevice){const s=$('cfgInputDevice');if(s)s.value=status.runtime?.selected_input_device||''}
+  if(!cfgDirty.outputDevice){const s=$('cfgOutputDevice');if(s)s.value=status.runtime?.selected_output_device||''}
+  updateMode()}
+// ── Signal lamp helpers ──────────────────────────────────────────────────────
+// Returns dBFS for a source from current stats
+function sourceDb(srcId){
+  if(srcId.startsWith('input:')){const ch=parseInt(srcId.slice(6));return(stats.input_peak_dbfs||[])[ch]??-120}
+  if(srcId==='ebu:l'){// EBU L: -18dBFS with 250ms silence every 3s
+    const pos=(Date.now()%3000);return pos<250?-120:-18}
+  if(srcId==='ebu:r')return -18;
+  if(srcId.startsWith('peer:remote:ch:')){const ch=parseInt(srcId.split(':').pop());return(stats.rx_peak_dbfs||[])[ch]??-120}
+  return -120}
+function lampClass(db){if(db>-10)return'red';if(db>-18)return'orange';if(db>-90)return'green';return''}
+// Update all rsig lamps without rebuilding the table
+function updateSignalLamps(){
+  document.querySelectorAll('[data-src-id]').forEach(el=>{
+    const db=sourceDb(el.dataset.srcId);
+    el.className='rsig '+lampClass(db)})}
+// ── Home render ──────────────────────────────────────────────────────────────
+function render(){
+  const st=status.peer_status||'gray';
+  const remote=status.remote||{};
+  const badge=$('connBadge'),lamp=$('peerLamp'),pt=$('peerText');
+  if(st==='green'){badge.className='conn-badge green';lamp.className='lamp green';pt.textContent='Connected — '+(remote.node_id||'remote device');$('alertbar').className='alertbar'}
+  else if(st==='orange'){badge.className='conn-badge orange';lamp.className='lamp orange';pt.textContent='Remote device degraded';$('alertbar').className='alertbar degraded show';$('alertbar').textContent='REMOTE DEVICE DEGRADED'}
+  else{badge.className='conn-badge gray';lamp.className='lamp gray';pt.textContent='No connected device';$('alertbar').className='alertbar offline show';$('alertbar').textContent='REMOTE DEVICE OFFLINE'}
+  $('localName').textContent=status.node_id||'—';$('nodeLine').textContent=status.node_id||'—';
+  $('localCh').textContent=(status.local_channels||0)+' ch';$('localBr').textContent=status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—';
+  $('localCodec').textContent=status.runtime?.encoder_mode||'music';
+  const plc=$('localPl');if(status.runtime?.phase_lock!==false){plc.textContent='phase lock';plc.className='nsub-chip live'}else{plc.textContent='no phase lock';plc.className='nsub-chip'}
+  const rn=$('remoteNameHome');
+  if(st!=='gray'){rn.textContent=remote.node_id||status.runtime?.remote_device_name||'—';rn.style.color='var(--ink)';const chips=[];if((remote.channels||0)>0)chips.push(remote.channels+' ch');$('remoteChips').innerHTML=chips.map(ch=>`<span class="nsub-chip">${esc(ch)}</span>`).join('')}
+  else{rn.textContent='—';rn.style.color='var(--muted)';$('remoteChips').innerHTML=''}
+  const ow=stats.one_way_latency_ms||0;$('owVal').innerHTML=ow.toFixed(1)+'<span class="u"> ms</span>';$('owVal').className='sval '+rttCls(ow);
+  $('txBw').textContent=(stats.tx_mbps||0).toFixed(3);$('rxBw').textContent=(stats.rx_mbps||0).toFixed(3);
+  const loss=stats.loss_percent||0;$('lossVal').innerHTML=loss.toFixed(2)+'<span class="u"> %</span>';$('lossVal').className='sval '+lossCls(loss);
+  const jit=stats.jitter_ms||0;$('jitterVal').innerHTML=jit.toFixed(1)+'<span class="u"> ms</span>';$('jitterVal').className='sval '+(jit>20?'warn':'ok');
+  // Buffer bar
+  const fill=stats.fill_ms||0,target=stats.target_ms||status.runtime?.latency_ms||120,MAX=target*2;
+  const fp=Math.min(100,fill/MAX*100),tp=Math.min(100,target/MAX*100);
+  const bf=$('bufFill');bf.style.width=fp+'%';
+  bf.className='buffill'+(fill<20?' bad':fill<60?' warn':'');
+  $('bufTick').style.left=tp+'%';
+  // Position the legend target label at the same % as the tick
+  const lbl=$('bufTickLbl');if(lbl){lbl.textContent=target+' ms';lbl.style.left=tp+'%'}
+  $('fillMs').textContent=Number.isFinite(fill)?Math.round(fill):fill;$('targetMs').textContent=target;const blm=$('bufLegMax');if(blm)blm.textContent=MAX+' ms';
+  $('tMode').textContent=status.runtime?.remote_host?'direct IP':(status.runtime?.remote_device_name?'cloud':'passive');$('tHost').textContent=status.runtime?.remote_host||'—';
+  $('dRtt').textContent=(stats.rtt_ms||0).toFixed(1)+' ms';$('dOwLat').textContent=(stats.one_way_latency_ms||0).toFixed(1)+' ms';
+  const d=stats.drift_pressure_ppm||0;$('dDrift').textContent=(d>=0?'+':'')+d+' ppm';
+  $('dFps').textContent=(stats.decoded_fps||0).toFixed(1);$('dTxFps').textContent=(stats.tx_fps||0).toFixed(1);
+  $('dQ').textContent=stats.queued_groups||0;$('dOv').textContent=stats.ring_overflows||0;
+  $('dPlc').textContent=stats.plc_channels||0;$('dMiss').textContent=stats.seq_missing||0;
+  $('dSug').textContent=stats.recommended_buffer_ms?stats.recommended_buffer_ms+' ms':'—';
+  $('dUf').textContent=stats.output_underflows||0;$('dUp').textContent=(status.uptime_seconds||0)+' s';
+  renderMeters();updateSetupFromStatus();updateSignalLamps()}
+// ── Meters ───────────────────────────────────────────────────────────────────
+const DB_FLOOR=-60,DB_RANGE=60,DB_G=-18,DB_O=-10;
+function segH(db){if(!Number.isFinite(db)||db<=DB_FLOOR-.5)return{g:0,o:0,r:0};const s=Math.max(DB_FLOOR,Math.min(0,db));return{g:Math.max(0,(Math.min(s,DB_G)-DB_FLOOR)/DB_RANGE*100),o:Math.max(0,(Math.min(s,DB_O)-DB_G)/DB_RANGE*100),r:Math.max(0,(s-DB_O)/DB_RANGE*100)}}
+function dbTop(db){return(1-(db-DB_FLOOR)/DB_RANGE)*100}
+function makeMeter(lbl,key,ticks){const t=ticks?`<div class="barticks"><div class="tlbl hi" style="top:${dbTop(0)}%">0</div><div class="tlbl" style="top:${dbTop(DB_O)}%">-10</div><div class="tlbl" style="top:${dbTop(DB_G)}%">-18</div><div class="tlbl" style="top:${dbTop(DB_FLOOR)}%">-60</div></div>`:'';return`<div class="meter"><div class="bartrack" style="${ticks?'margin-left:32px':''}">${t}<div class="sg" id="sg_${key}" style="height:0"></div><div class="so" id="so_${key}" style="height:0;bottom:0"></div><div class="sr" id="sr_${key}" style="height:0;bottom:0"></div></div><div class="mdb" id="mdb_${key}">−∞</div><div class="mlbl">${lbl}</div></div>`}
+function updateMeter(key,db){const{g,o,r}=segH(db);const G=$('sg_'+key),O=$('so_'+key),R=$('sr_'+key),D=$('mdb_'+key);if(!G)return;G.style.height=g+'%';G.style.bottom='0';O.style.height=o+'%';O.style.bottom=g+'%';R.style.height=r+'%';R.style.bottom=(g+o)+'%';if(D)D.textContent=db>-100?db.toFixed(1):'−∞'}
+function renderMeters(){
+  const txPeaks=stats.tx_peak_dbfs||[];const rxPeaks=stats.rx_peak_dbfs||[];const monPeaks=stats.monitor_peak_dbfs||[-120,-120];
+  const connected=(status.peer_status==='green'||status.peer_status==='orange');
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  const rxSrcs=connected?(matrix.sources||[]).filter(s=>s.kind==='network_receive'):[];
+  const txN=Math.max(txPeaks.length,txDests.length,1);const rxN=connected?Math.max(rxPeaks.length,rxSrcs.length):0;
+  const txBank=$('txMeters'),rxBank=$('rxMeters'),monBank=$('monMeters');if(!txBank)return;
+  const txKey='tx'+txN+(txDests.map(d=>d.label).join('|'));
+  if(txBank.dataset.key!==txKey){txBank.innerHTML=txDests.map((d,i)=>{const lbl=d.label.replace(/^Send \d+ — /,'');return makeMeter('Ch '+(i+1)+(lbl?' — '+lbl:''),`tx${i}`,i===0)}).join('')||makeMeter('Ch 1','tx0',true);txBank.dataset.key=txKey}
+  if(rxBank.dataset.key!==String(rxN)){rxBank.innerHTML=rxN>0?Array.from({length:rxN},(_,i)=>makeMeter('Ch '+(i+1),`rx${i}`,i===0)).join(''):'<div style="color:var(--muted);font-size:12px;padding:8px 0">No connected remote device</div>';rxBank.dataset.key=String(rxN)}
+  if(!monBank.children.length){monBank.innerHTML=makeMeter('L','mn0',true)+makeMeter('R','mn1',false)}
+  txPeaks.forEach((v,i)=>updateMeter('tx'+i,v));rxPeaks.forEach((v,i)=>updateMeter('rx'+i,v));[monPeaks[0]??-120,monPeaks[1]??-120].forEach((v,i)=>updateMeter('mn'+i,v))}
+// ── Hover highlight ──────────────────────────────────────────────────────────
+function setupHover(tableId){const tbl=$(tableId);if(!tbl)return;let pRow=null,pCols=[];function clear(){if(pRow)pRow.classList.remove('hl-row');pCols.forEach(c=>c.classList.remove('hl-col'));pRow=null;pCols=[]}tbl.addEventListener('mouseover',e=>{const cell=e.target.closest('td,th');if(!cell)return;clear();const tr=cell.parentElement;if(tr.parentElement.tagName==='TBODY'){tr.classList.add('hl-row');pRow=tr}const col=cell.cellIndex;const cols=Array.from(tbl.querySelectorAll(`tr>*:nth-child(${col+1})`));cols.forEach(c=>c.classList.add('hl-col'));pCols=cols});tbl.addEventListener('mouseleave',clear)}
+// ── Label logic ──────────────────────────────────────────────────────────────
+function syncLabelsFromMatrix(){
+  (matrix.destinations||[]).filter(d=>d.kind==='network_send').forEach(d=>{
+    const serverLabel=d.label.replace(/^Send \d+ — /,'');
+    const route=(matrix.routes||[]).find(r=>r.destination===d.id&&!r.source.startsWith('ebu:'));
+    if(route&&serverLabel&&serverLabel!==`Ch ${(matrix.destinations.indexOf(d)+1)}`){
+      if(!srcUserLabels[route.source])srcUserLabels[route.source]=serverLabel}
+  })}
+function getSrcLabel(srcId){const v=srcUserLabels[srcId];return v===undefined?'':v}
+function getColLabel(destId){
+  const routes=(matrix.routes||[]).filter(r=>r.destination===destId&&!r.source.startsWith('ebu:'));
+  if(!routes.length)return'';
+  if(routes.length===1)return getSrcLabel(routes[0].source);
+  const labels=routes.map(r=>getSrcLabel(r.source)).filter(Boolean);
+  return labels.join(' + ')||''}
+async function pushAllLabels(){
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  const labels=txDests.map(d=>{
+    const routes=(matrix.routes||[]).filter(r=>r.destination===d.id&&!r.source.startsWith('ebu:'));
+    if(!routes.length)return '';
+    if(routes.length===1)return getSrcLabel(routes[0].source)||d.label.replace(/^Send \d+ — /,'');
+    const mixed=routes.map(r=>getSrcLabel(r.source)).filter(Boolean);
+    return mixed.join(' + ')||d.label.replace(/^Send \d+ — /,'')});
+  try{const res=await fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})});const newMatrix=await res.json();matrix=newMatrix;matrixLastKey='';buildMatrices()}catch(e){console.error(e)}}
+async function saveSrcLabel(srcId,label){
+  srcUserLabels[srcId]=label.trim();
+  refreshTxColHeaders();
+  await pushAllLabels()}
+// ── Route toggle ─────────────────────────────────────────────────────────────
+async function doRouteToggle(srcId,destId){
+  if(routeBusy)return;routeBusy=true;
+  try{
+    let routes=[...(matrix.routes||[])];
+    const exists=routes.findIndex(r=>r.source===srcId&&r.destination===destId);
+    if(exists>=0){
+      routes.splice(exists,1)
+    }else{
+      const isInput=srcId.startsWith('input:');
+      if(isInput){routes=routes.filter(r=>!(r.destination===destId&&(r.source==='ebu:l'||r.source==='ebu:r')))}
+      const isTone=srcId==='ebu:l'||srcId==='ebu:r';
+      if(isTone){routes=routes.filter(r=>!(r.destination===destId&&r.source.startsWith('input:')))}
+      routes.push({source:srcId,destination:destId})}
+    const body={routes};
+    if(destId.startsWith('output:'))body.monitor_mode='patch_matrix';
+    const res=await fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+    matrix=await res.json();matrixLastKey='';buildMatrices();
+    await pushAllLabels()
+  }finally{routeBusy=false}}
+// ── Send routing ─────────────────────────────────────────────────────────────
+function buildTxTable(){
+  const txSrcsReg=(matrix.sources||[]).filter(s=>s.kind==='physical_input');
+  const txSrcsUtil=(matrix.sources||[]).filter(s=>s.kind==='test_tone');
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  const activeRoutes=new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination));
+  const numCh=txDests.length;
+  if(!numCh){$('txBody').innerHTML='<tr><td style="padding:16px;color:var(--muted);font-size:12px" colspan="1">No send channels configured</td></tr>';$('txHead').innerHTML='';return}
+  let hRow=`<tr><th class="rh"></th>`;
+  txDests.forEach((d,i)=>{const lbl=getColLabel(d.id);hRow+=`<th><div class="ch-hdr"><div class="ch-hdr-num">${i+1}</div><div class="ch-hdr-lbl" id="chlbl_${esc(d.id)}">${esc(lbl)}</div></div></th>`});
+  hRow+='</tr>';$('txHead').innerHTML=hRow;
+  let rows='';
+  function srcRow(src,editable){
+    const lbl=editable?getSrcLabel(src.id):'';
+    const sysName=src.kind==='physical_input'?src.label.replace(/Local Input/,'Local In'):src.label;
+    const labelPart=editable?`<span class="src-sep">•</span><input class="src-label-input" data-src="${esc(src.id)}" value="${esc(lbl)}" maxlength="20" spellcheck="false" autocomplete="off" placeholder="label…">`:'';
+    rows+=`<tr><td class="rh"><div class="src-row"><span class="rsig" data-src-id="${esc(src.id)}"></span><span class="src-sysname">${esc(sysName)}</span>${labelPart}</div></td>`;
+    txDests.forEach(d=>{const on=activeRoutes.has(src.id+'>'+d.id);rows+=`<td class="xcell${on?' on':''}" data-src="${esc(src.id)}" data-dst="${esc(d.id)}"></td>`});
+    rows+='</tr>'}
+  txSrcsReg.forEach(s=>srcRow(s,true));
+  if(txSrcsUtil.length){rows+=`<tr class="src-spacer"><td class="rh" style="height:10px"></td>${'<td style="height:10px;background:var(--bg);width:60px"></td>'.repeat(numCh)}</tr>`;txSrcsUtil.forEach(s=>srcRow(s,false))}
+  $('txBody').innerHTML=rows;
+  const inputs=Array.from(document.querySelectorAll('#txBody .src-label-input'));
+  inputs.forEach((el,idx)=>{
+    el.addEventListener('focus',()=>el.select());
+    el.addEventListener('input',()=>{el.classList.add('dirty');srcUserLabels[el.dataset.src]=el.value;refreshTxColHeaders()});
+    el.addEventListener('keydown',e=>{
+      if(e.key==='Enter'){e.preventDefault();saveSrcLabel(el.dataset.src,el.value);el.classList.remove('dirty');const nx=inputs[idx+1];nx?nx.focus():el.blur()}
+      if(e.key==='Escape'){el.value=getSrcLabel(el.dataset.src);el.classList.remove('dirty');el.blur()}});
+    el.addEventListener('blur',()=>{if(el.classList.contains('dirty')){saveSrcLabel(el.dataset.src,el.value);el.classList.remove('dirty')}})});
+  $('txBody').addEventListener('click',e=>{const cell=e.target.closest('.xcell');if(cell&&!e.target.closest('input'))doRouteToggle(cell.dataset.src,cell.dataset.dst)});
+  setupHover('txTable');
+  updateSignalLamps()}
+function refreshTxColHeaders(){
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  txDests.forEach(d=>{const el=document.getElementById('chlbl_'+d.id);if(el)el.textContent=getColLabel(d.id)})}
+function doTx1to1(){
+  const txSrcsReg=(matrix.sources||[]).filter(s=>s.kind==='physical_input');
+  const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
+  let routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('input:'));
+  const n=Math.min(txSrcsReg.length,txDests.length);
+  for(let i=0;i<n;i++)routes.push({source:txSrcsReg[i].id,destination:txDests[i].id});
+  fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(async m=>{matrix=m;matrixLastKey='';buildMatrices();await pushAllLabels()}).catch(console.error)}
+function doTxClear(){
+  const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('input:'));
+  fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(async m=>{matrix=m;matrixLastKey='';buildMatrices();await pushAllLabels()}).catch(console.error)}
+// ── Receive routing ──────────────────────────────────────────────────────────
+function doResetLabels(){Object.keys(srcUserLabels).forEach(k=>delete srcUserLabels[k]);const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const labels=txDests.map(()=>'');fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+function buildRxTable(){
+  const connected=(status.peer_status==='green'||status.peer_status==='orange');
+  const rxSrcs=connected?(matrix.sources||[]).filter(s=>s.kind==='network_receive'):[];
+  const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');
+  const activeRoutes=new Set((matrix.routes||[]).map(r=>r.source+'>'+r.destination));
+  const numOut=rxDests.length;
+  if(!rxSrcs.length||!numOut){
+    $('rxHead').innerHTML=`<tr><th class="rh"></th></tr>`;
+    $('rxBody').innerHTML='<tr><td style="padding:16px;color:var(--muted);font-size:12px" colspan="1">No connected remote device</td></tr>';return}
+  let hRow=`<tr><th class="rh"></th>`;
+  rxDests.forEach(d=>{const n=d.label.replace('Local Output ','Out ');hRow+=`<th><div class="ch-hdr"><div class="ch-hdr-num">${esc(n)}</div></div></th>`});
+  hRow+='</tr>';$('rxHead').innerHTML=hRow;
+  let rows='';
+  rxSrcs.forEach(src=>{
+    const sep=src.label.indexOf(' \u2022 ');
+    const sysName=sep>=0?src.label.slice(0,sep):src.label;
+    const chName=sep>=0?src.label.slice(sep+3):'';
+    const labelPart=chName?`<span class="src-sep">\u2022</span><span style="font-size:11px;font-weight:600;color:var(--ink)">${esc(chName)}</span>`:'';
+    rows+=`<tr><td class="rh"><div class="src-row"><span class="rsig" data-src-id="${esc(src.id)}"></span><span class="src-sysname">${esc(sysName)}</span>${labelPart}</div></td>`;
+    rxDests.forEach(d=>{const on=activeRoutes.has(src.id+'>'+d.id);rows+=`<td class="xcell${on?' on':''}" data-src="${esc(src.id)}" data-dst="${esc(d.id)}"></td>`});
+    rows+='</tr>'});
+  $('rxBody').innerHTML=rows;
+  $('rxBody').addEventListener('click',e=>{const cell=e.target.closest('.xcell');if(cell)doRouteToggle(cell.dataset.src,cell.dataset.dst)});
+  setupHover('rxTable');
+  updateSignalLamps()}
+function doRx1to1(){
+  const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');
+  const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');
+  const nonRx=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));
+  const routes=[...nonRx];const n=Math.min(rxSrcs.length,rxDests.length);
+  for(let i=0;i<n;i++)routes.push({source:rxSrcs[i].id,destination:rxDests[i].id});
+  fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes,monitor_mode:'patch_matrix'})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+function doRxClear(){
+  const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));
+  fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
+// ── Matrix key + build ───────────────────────────────────────────────────────
+function matrixKey(){return JSON.stringify({p:status.peer_status||'gray',s:(matrix.sources||[]).map(s=>s.id+s.kind+s.label),d:(matrix.destinations||[]).map(d=>d.id+d.label),r:(matrix.routes||[]).map(r=>r.source+r.destination).sort()})}
+function buildMatrices(){
+  syncLabelsFromMatrix();
+  const k=matrixKey();if(k===matrixLastKey){refreshTxColHeaders();updateSignalLamps();return}
+  matrixLastKey=k;buildTxTable();buildRxTable()}
+// ── Audio devices ────────────────────────────────────────────────────────────
+function renderDevices(){$('devices').innerHTML=`<div class="devrow"><span class="dk">Sample rate</span><b>${devices.sample_rate||48000} Hz</b></div><div class="devrow"><span class="dk">Default input</span><b>${esc(devices.default_input||'none')}</b></div><div class="devrow"><span class="dk">Input channels</span><b>${devices.default_input_channels??0}</b></div><div class="devrow"><span class="dk">Default output</span><b>${esc(devices.default_output||'none')}</b></div><div class="devrow"><span class="dk">Output channels</span><b>${devices.default_output_channels??0}</b></div>`}
+// ── Interface + device dropdowns ────────────────────────────────────────────
+function populateInterfaces(ifaces){
+  const sel=$('cfgInterface');if(!sel)return;
+  const current=sel.value;
+  // Keep the "Any" option, replace the rest
+  while(sel.options.length>1)sel.remove(1);
+  (ifaces||[]).forEach(iface=>{
+    const opt=document.createElement('option');
+    opt.value=iface.addr;
+    opt.textContent=iface.name+' — '+iface.addr;
+    sel.appendChild(opt)});
+  if(current)sel.value=current}
+function populateDeviceDropdowns(devs){
+  const inSel=$('cfgInputDevice'),outSel=$('cfgOutputDevice');
+  if(!inSel||!outSel)return;
+  const curIn=inSel.value,curOut=outSel.value;
+  while(inSel.options.length>1)inSel.remove(1);
+  while(outSel.options.length>1)outSel.remove(1);
+  (devs.inputs||[]).forEach(name=>{
+    const opt=document.createElement('option');opt.value=name;opt.textContent=name;inSel.appendChild(opt)});
+  (devs.outputs||[]).forEach(name=>{
+    const opt=document.createElement('option');opt.value=name;opt.textContent=name;outSel.appendChild(opt)});
+  if(curIn)inSel.value=curIn;
+  if(curOut)outSel.value=curOut}
+// ── Offline overlay ──────────────────────────────────────────────────────────
+let pollFailCount=0;
+function showOffline(){document.body.innerHTML='<div style="position:fixed;inset:0;background:#080a0d;display:flex;align-items:center;justify-content:center;z-index:999"><div style="text-align:center;color:#7e8fa0;font:14px/2 system-ui,sans-serif"><div style="font-size:22px;font-weight:700;color:#e04040;margin-bottom:8px">Device offline</div></div></div>'}
+// ── Poll ─────────────────────────────────────────────────────────────────────
+async function poll(){
+  try{
+    [status,stats,matrix]=await Promise.all([fetch('/api/status').then(r=>r.json()),fetch('/api/stats').then(r=>r.json()),fetch('/api/routes').then(r=>r.json())]);
+    pollFailCount=0;render();buildMatrices()
+  }catch(e){
+    pollFailCount++;if(pollFailCount>=3)showOffline()}}
+// ── Init ─────────────────────────────────────────────────────────────────────
+fetch('/api/device-ip').then(r=>r.json()).then(d=>{$('deviceIpInput').value=d.ip||'unknown'}).catch(()=>{const el=$('deviceIpInput');if(el)el.value='unknown'});
+fetch('/api/audio/devices').then(r=>r.json()).then(d=>{devices=d;renderDevices();populateDeviceDropdowns(d)}).catch(console.error);
+fetch('/api/interfaces').then(r=>r.json()).then(populateInterfaces).catch(console.error);
+poll();setInterval(poll,200);
+</script>
+</body>
+</html>
