@@ -228,43 +228,141 @@ pub fn sleep_until(deadline: Instant) {
 
 // ─── Device config helpers ────────────────────────────────────────────────────
 
-/// Check whether a device supports a specific sample rate and channel count.
-fn input_supports_rate(device: &cpal::Device, rate: u32, channels: u16) -> bool {
-    use cpal::traits::DeviceTrait;
-    device.supported_input_configs().ok()
-        .map(|cfgs| cfgs.into_iter().any(|c|
-            c.channels() >= channels
-                && c.min_sample_rate().0 <= rate
-                && c.max_sample_rate().0 >= rate))
-        .unwrap_or(false)
-}
+/// On macOS, attempt to set the CoreAudio device's nominal sample rate to
+/// `rate` Hz before cpal opens a stream.  This overrides whatever Audio MIDI
+/// Setup has selected.  Other platforms: no-op.
+///
+/// Requires the `coreaudio-sys` crate in Cargo.toml:
+///   [target.'cfg(target_os = "macos")'.dependencies]
+///   coreaudio-sys = "0.2"
+pub fn try_force_device_sample_rate(_device_name: &str, _rate: u32) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::mem;
+        // We need the CoreAudio device ID. Enumerate all devices and match by name.
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            use coreaudio_sys::*;
 
-fn output_supports_rate(device: &cpal::Device, rate: u32, channels: u16) -> bool {
-    use cpal::traits::DeviceTrait;
-    device.supported_output_configs().ok()
-        .map(|cfgs| cfgs.into_iter().any(|c|
-            c.channels() >= channels
-                && c.min_sample_rate().0 <= rate
-                && c.max_sample_rate().0 >= rate))
-        .unwrap_or(false)
+            // Get all audio device IDs
+            let property_address = AudioObjectPropertyAddress {
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+            let mut data_size: u32 = 0;
+            let status = unsafe {
+                AudioObjectGetPropertyDataSize(
+                    kAudioObjectSystemObject,
+                    &property_address, 0, std::ptr::null(), &mut data_size)
+            };
+            if status != 0 { return Err(format!("GetPropertyDataSize: {status}").into()); }
+
+            let device_count = data_size as usize / mem::size_of::<AudioDeviceID>();
+            let mut device_ids = vec![0u32; device_count];
+            let status = unsafe {
+                AudioObjectGetPropertyData(
+                    kAudioObjectSystemObject, &property_address,
+                    0, std::ptr::null(), &mut data_size,
+                    device_ids.as_mut_ptr() as *mut _)
+            };
+            if status != 0 { return Err(format!("GetPropertyData devices: {status}").into()); }
+
+            // Find device matching our name
+            for &device_id in &device_ids {
+                let name_addr = AudioObjectPropertyAddress {
+                    mSelector: kAudioObjectPropertyName,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMaster,
+                };
+                let mut cf_name: coreaudio_sys::CFStringRef = std::ptr::null();
+                let mut sz = mem::size_of::<coreaudio_sys::CFStringRef>() as u32;
+                let status = unsafe {
+                    AudioObjectGetPropertyData(device_id, &name_addr, 0, std::ptr::null(),
+                        &mut sz, &mut cf_name as *mut _ as *mut _)
+                };
+                if status != 0 || cf_name.is_null() { continue; }
+
+                // Convert CFString to Rust String
+                let name_len = unsafe { coreaudio_sys::CFStringGetLength(cf_name) } as usize;
+                let mut buf = vec![0u8; name_len * 4 + 4];
+                let ok = unsafe {
+                    coreaudio_sys::CFStringGetCString(
+                        cf_name, buf.as_mut_ptr() as *mut _, buf.len() as _,
+                        coreaudio_sys::kCFStringEncodingUTF8)
+                };
+                if ok == 0 { continue; }
+                let name = std::ffi::CStr::from_bytes_until_nul(&buf)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                if name != _device_name { continue; }
+
+                // Found it — set the nominal sample rate
+                let rate_addr = AudioObjectPropertyAddress {
+                    mSelector: kAudioDevicePropertyNominalSampleRate,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMaster,
+                };
+                let rate_f64 = _rate as f64;
+                let sz = mem::size_of::<f64>() as u32;
+                let status = unsafe {
+                    AudioObjectSetPropertyData(device_id, &rate_addr, 0, std::ptr::null(),
+                        sz, &rate_f64 as *const f64 as *const _)
+                };
+                if status == 0 {
+                    tracing::info!("CoreAudio: set '{name}' nominal rate to {_rate}Hz");
+                } else {
+                    tracing::warn!("CoreAudio: set rate failed for '{name}': status {status}");
+                }
+                return Ok(());
+            }
+            tracing::warn!("CoreAudio: device '{_device_name}' not found for rate-forcing");
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!("CoreAudio rate-force error: {e}");
+        }
+    }
 }
 
 /// Returns `(stream_config, device_sample_rate)`.
-/// Tries 48kHz first; if the device doesn't support it, falls back to the
-/// device's default rate.  The caller is responsible for resampling if
-/// `device_sample_rate != SAMPLE_RATE`.
+///
+/// Strategy: always attempt to open at 48kHz first by checking the supported
+/// config ranges. If the driver reports 48kHz is in range, we use it — this
+/// works even when the default config is at another rate (e.g. PipeWire
+/// configured at 44100 but hardware supports 48kHz).
+///
+/// If 48kHz is genuinely unsupported (e.g. Bluetooth HFP mic at 16/24kHz),
+/// we fall back to the device's native rate and resample in software.
 pub fn best_input_config(device: &cpal::Device, preferred_channels: usize) -> (cpal::StreamConfig, u32) {
     use cpal::traits::DeviceTrait;
     let native = device.default_input_config()
         .map(|c| (c.sample_rate().0, c.channels()))
         .unwrap_or((SAMPLE_RATE, preferred_channels as u16));
     let channels = (preferred_channels as u16).min(native.1).max(1);
-    let rate = if input_supports_rate(device, SAMPLE_RATE, channels) {
+
+    // Check supported ranges — ask for 48kHz in the supported range rather than
+    // just accepting the default.  PipeWire often reports 44100 as default but
+    // will happily run at 48kHz if asked.
+    let supported_48 = device.supported_input_configs().ok()
+        .map(|cfgs| cfgs.into_iter().any(|c|
+            c.channels() >= channels
+            && c.min_sample_rate().0 <= SAMPLE_RATE
+            && c.max_sample_rate().0 >= SAMPLE_RATE))
+        .unwrap_or(false);
+
+    let rate = if supported_48 {
+        if native.0 != SAMPLE_RATE {
+            tracing::info!(
+                "Input: device default is {}Hz but 48kHz is supported — requesting 48kHz",
+                native.0
+            );
+        }
         SAMPLE_RATE
     } else {
         tracing::warn!(
-            "Input device doesn't support {}Hz/{}ch — using {}Hz/{}ch + software resample",
-            SAMPLE_RATE, channels, native.0, channels
+            "Input: {}Hz not supported — using {}Hz + software resample to 48kHz",
+            SAMPLE_RATE, native.0
         );
         native.0
     };
@@ -276,16 +374,29 @@ pub fn best_output_config(device: &cpal::Device, preferred_channels: u16) -> (cp
     let native = device.default_output_config()
         .map(|c| (c.sample_rate().0, c.channels()))
         .unwrap_or((SAMPLE_RATE, preferred_channels));
-    let rate = if output_supports_rate(device, SAMPLE_RATE, preferred_channels) {
+
+    let supported_48 = device.supported_output_configs().ok()
+        .map(|cfgs| cfgs.into_iter().any(|c|
+            c.channels() >= preferred_channels
+            && c.min_sample_rate().0 <= SAMPLE_RATE
+            && c.max_sample_rate().0 >= SAMPLE_RATE))
+        .unwrap_or(false);
+
+    let rate = if supported_48 {
+        if native.0 != SAMPLE_RATE {
+            tracing::info!(
+                "Output: device default is {}Hz but 48kHz is supported — requesting 48kHz",
+                native.0
+            );
+        }
         SAMPLE_RATE
     } else {
         tracing::warn!(
-            "Output device doesn't support {}Hz — using {}Hz + software resample",
+            "Output: {}Hz not supported — using {}Hz + software resample from 48kHz",
             SAMPLE_RATE, native.0
         );
         native.0
     };
-    // Always stereo on output
     (cpal::StreamConfig { channels: preferred_channels, sample_rate: cpal::SampleRate(rate), buffer_size: ALSA_PERIOD }, rate)
 }
 

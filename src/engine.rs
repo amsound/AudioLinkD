@@ -388,6 +388,11 @@ pub fn run_bidir(
     // ── Receive / playback pipeline ─────────────────────────────────────────
     let _out_stream: Option<cpal::Stream> = if recv_enabled {
         let out_device = find_output_device(&selected_output_device).ok_or_else(|| anyhow!("No output device"))?;
+        // On macOS: attempt to set the CoreAudio nominal rate to 48kHz before
+        // cpal opens the stream. This overrides Audio MIDI Setup.
+        if let Ok(name) = out_device.name() {
+            try_force_device_sample_rate(&name, SAMPLE_RATE);
+        }
         let (out_config, out_device_rate) = best_output_config(&out_device, 2);
         tracing::info!("Output: {} @ {}Hz stereo{}",
             out_device.name().unwrap_or_default(),
@@ -1069,6 +1074,9 @@ pub fn run_bidir(
                 Some(_default_dev) => {
                     let in_dev = find_input_device(&selected_input_device)
                         .unwrap_or(_default_dev);
+                    if let Ok(name) = in_dev.name() {
+                        try_force_device_sample_rate(&name, SAMPLE_RATE);
+                    }
                     let (in_cfg, in_device_rate) = best_input_config(&in_dev, in_channels);
                     let actual_in_channels = in_cfg.channels as usize;
                     tracing::info!("Input: {} @ {}Hz {}ch{}",
