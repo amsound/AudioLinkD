@@ -151,15 +151,36 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
 .devrow:last-child{border-bottom:none}
 .dk{color:var(--muted)}
 .card-divider{border:none;border-top:1px solid var(--line);margin:12px 0}
+
+/* ── Home: connections card ─────────────────────────────────────────── */
+.conn-divider{border:none;border-top:0.5px solid var(--line);margin:.625rem 0}
+.conn-row{transition:opacity .15s}
+.conn-offline{opacity:.4}
+.conn-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+.conn-name{font-size:14px;font-weight:500;color:var(--ink)}
+.conn-sub{font-size:12px;color:var(--muted);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conn-more{font-size:11px;color:var(--muted);cursor:pointer;margin-top:3px;user-select:none;display:inline}
+.conn-stats{display:grid;grid-template-columns:1fr 1fr 1fr 1.4fr;gap:5px;width:310px;flex-shrink:0}
+.conn-agg{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;width:310px;flex-shrink:0}
+.cst{background:var(--panel2);border-radius:8px;padding:5px 8px;min-width:0;overflow:hidden}
+.cst-wide{}
+.csl{font-size:11px;color:var(--muted);white-space:nowrap}
+.csv{font-size:14px;font-weight:500;color:var(--ink);white-space:nowrap}
+.csv.ok{color:#1D9E75}.csv.warn{color:#BA7517}.csv.muted{color:var(--muted)}
+.hbuf-track{height:6px;border-radius:3px;background:var(--line);margin-top:4px;position:relative;overflow:visible}
+.hbuf-fill{height:100%;border-radius:3px;position:absolute;left:0;top:0}
+.hbuf-mid{position:absolute;left:50%;top:-2px;bottom:-2px;width:1.5px;background:var(--muted);opacity:.35}
+.diag-row{display:flex;flex-wrap:wrap;margin-top:4px}
+.diag-item{display:inline-flex;gap:3px;font-size:10px;padding:1px 6px 1px 0;border-right:0.5px solid var(--line);margin-right:6px;margin-bottom:2px}
+.diag-item:last-child{border-right:none;margin-right:0}
+.dl{color:var(--muted)}.dv{color:var(--ink);font-weight:500}
 </style>
 </head>
 <body>
-<div id="alertbar" class="alertbar offline show">REMOTE DEVICE OFFLINE</div>
 <header>
   <div><div class="logo">Audio<span>Link</span></div><div class="nodeline" id="nodeLine">Starting…</div></div>
   <div class="hright">
     <button class="theme-btn" id="themeBtn" onclick="toggleTheme()"></button>
-    <div id="connBadge" class="conn-badge gray"><span class="lamp gray" id="peerLamp"></span><span id="peerText">No connected device</span></div>
   </div>
 </header>
 <nav>
@@ -172,63 +193,16 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
 </nav>
 <main>
 <section id="home" class="page active">
-  <div class="card mb">
-    <div class="ctitle">Link</div>
-    <div class="link-ov">
-      <div class="node-col">
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">This device</div>
-        <div class="nname" id="localName">—</div>
-        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px">
-          <span class="nsub-chip" id="localCh">—</span>
-          <span class="nsub-chip" id="localBr">—</span>
-          <span class="nsub-chip" id="localCodec">music</span>
-          <span class="nsub-chip" id="localPl">phase lock</span>
-        </div>
-      </div>
-      <div class="divv"></div>
-      <div class="node-col">
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px">Remote device</div>
-        <div class="nname" id="remoteNameHome" style="color:var(--muted)">—</div>
-        <div id="remoteChips" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px"></div>
-      </div>
+  <div class="card mb" id="thisDeviceCard">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:.625rem">
+      <div class="ctitle">This device</div>
+      <div style="font-size:11px;color:var(--muted)" id="deviceIpLine">—</div>
     </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap" id="thisDeviceChips"></div>
   </div>
-  <div class="statgrid">
-    <div class="stile"><div class="slbl">Round-trip time</div><div class="sval dim" id="rttVal">—<span class="u"> ms</span></div></div>
-    <div class="stile"><div class="slbl">TX</div><div class="sval dim"><span id="txBw">—</span><span class="u"> Mb/s</span></div></div>
-    <div class="stile"><div class="slbl">RX</div><div class="sval dim"><span id="rxBw">—</span><span class="u"> Mb/s</span></div></div>
-    <div class="stile"><div class="slbl">Packet loss</div><div class="sval ok" id="lossVal">—<span class="u"> %</span></div></div>
-    <div class="stile"><div class="slbl">Jitter EMA</div><div class="sval ok" id="jitterVal">—<span class="u"> ms</span></div></div>
-  </div>
-  <div class="card mb">
-    <div class="ctitle">Incoming Buffer</div>
-    <div class="bufrow"><span class="bufms" id="fillMs">—</span><span class="bufmeta">ms · target <b id="targetMs" style="color:var(--ink)">—</b> ms</span></div>
-    <div class="buftrack"><div class="buffill" id="bufFill" style="width:0"></div><div class="buftick" id="bufTick" style="left:100%"></div></div>
-    <div class="bufleg" id="bufLeg" style="position:relative;height:14px"><span style="position:absolute;left:0">0</span><span id="bufTickLbl" style="position:absolute;transform:translateX(-50%)">—</span><span id="bufLegMax" style="position:absolute;right:0">— ms</span></div>
-  </div>
-  <div class="card">
-    <div class="ctitle">Transport</div>
-    <div style="font-size:13px;color:var(--muted)">
-      <div>Mode: <b id="tMode" style="color:var(--ink)">—</b></div>
-      <div>Remote host: <b id="tHost" style="color:var(--ink)">—</b></div>
-    </div>
-    <details>
-      <summary>Diagnostics</summary>
-      <div class="dkv">
-        <span class="k">RTT</span><span class="v" id="dRtt">—</span>
-        <span class="k">One-way est.</span><span class="v" id="dOwLat">—</span>
-        <span class="k">Clock drift</span><span class="v" id="dDrift">—</span>
-        <span class="k">Decoded fps</span><span class="v" id="dFps">—</span>
-        <span class="k">TX fps</span><span class="v" id="dTxFps">—</span>
-        <span class="k">Queued groups</span><span class="v" id="dQ">—</span>
-        <span class="k">Ring overflows</span><span class="v" id="dOv">—</span>
-        <span class="k">PLC channels</span><span class="v" id="dPlc">—</span>
-        <span class="k">Seq missing</span><span class="v" id="dMiss">—</span>
-        <span class="k">Suggested buffer</span><span class="v" id="dSug">—</span>
-        <span class="k">Underflows</span><span class="v" id="dUf">—</span>
-        <span class="k">Uptime</span><span class="v" id="dUp">—</span>
-      </div>
-    </details>
+  <div class="card" id="connectionsCard">
+    <div class="ctitle" style="margin-bottom:.875rem">Connections</div>
+    <div id="connectionRows"></div>
   </div>
 </section>
 <section id="txrouting" class="page routing">
@@ -258,7 +232,7 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
       <div class="field">
         <label>Device name</label>
         <div class="idrow">
-          <input id="cfgNode" autocomplete="off" spellcheck="false" oninput="setupDirty()">
+          <input id="cfgNode" autocomplete="off" spellcheck="false" oninput="nodeNameDirty()">
           <button class="cpybtn" onclick="copyFeedback(this,$('cfgNode').value)">Copy</button>
         </div>
       </div>
@@ -270,15 +244,11 @@ table.mx{border-collapse:separate;border-spacing:0;table-layout:fixed}
       </div>
     </div>
     <div class="card" style="display:flex;flex-direction:column">
-      <div class="ctitle">Connect To</div>
-      <div class="field">
-        <label>Remote device name</label>
-        <input id="cfgRemoteName" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.remoteName=true;setupDirty()" style="font-family:var(--mono);font-size:13px;font-weight:600;width:100%">
+      <div class="ctitle" style="display:flex;align-items:center;justify-content:space-between">
+        Remote Connections
+        <button onclick="addRemote()" style="font-size:11px;padding:2px 10px;border-radius:6px">+ Add</button>
       </div>
-      <div class="field" style="margin-bottom:0;margin-top:auto">
-        <label>Remote IP</label>
-        <input id="cfgPeer" autocomplete="off" spellcheck="false" oninput="updateMode();cfgDirty.peer=true;setupDirty()" style="font-family:var(--mono);font-size:13px;font-weight:600;width:100%">
-      </div>
+      <div id="remotesContainer" style="display:flex;flex-direction:column;gap:10px;margin-top:8px"></div>
     </div>
   </div>
   <div class="sgrid mb" style="align-items:start">
@@ -344,29 +314,62 @@ function rttCls(ms){return ms>100?'bad':ms>40?'warn':'ok'}
 function lossCls(p){return p>2?'bad':p>.5?'warn':'ok'}
 // Double-tap confirm
 function routeConfirm(btnId,action){if(armTimers[btnId]){clearTimeout(armTimers[btnId]);delete armTimers[btnId];$(btnId).classList.remove('arm');action()}else{$(btnId).classList.add('arm');armTimers[btnId]=setTimeout(()=>{$(btnId).classList.remove('arm');delete armTimers[btnId]},3000)}}
-// Setup
-// Mark apply button as needing attention when any setup field changes
-function setupDirty(){
-  const btn=$('applyBtn');
-  if(btn&&!btn.classList.contains('arm')&&!btn.classList.contains('done')){
-    btn.classList.add('dirty');
-    btn.textContent='Apply & rebuild engine ●';
-  }
+// Setup — remotes list management
+let remotesList = [];
+let nextRemoteIndex = 0;
+
+function addRemote() {
+  remotesList.push({index:nextRemoteIndex++,name:'',ip_override:'',password:null,channels_to_send:[],enabled:true});
+  cfgDirty.remotes=true; setupDirty(); renderRemotes();
 }
-function clearSetupDirty(){
-  const btn=$('applyBtn');
-  if(btn){btn.classList.remove('dirty');btn.textContent='Apply & rebuild engine';}
+
+function removeRemote(idx) {
+  remotesList=remotesList.filter(r=>r.index!==idx);
+  cfgDirty.remotes=true; setupDirty(); renderRemotes();
 }
-function updateMode(){const ip=($('cfgPeer').value||'').trim(),nm=($('cfgRemoteName').value||'').trim(),p=$('modePill'),l=$('modeLabel');if(!p||!l)return;if(ip){p.className='mpill dir';l.textContent='Direct IP'}else if(nm){p.className='mpill rdv';l.textContent='Cloud'}else{p.className='mpill pas';l.textContent='Passive'}}
+
+function renderRemotes() {
+  const c=$('remotesContainer'); if(!c) return;
+  if(!remotesList.length){c.innerHTML='<div style="color:var(--sub);font-size:12px;padding:4px 0">No remotes configured</div>';return}
+  c.innerHTML=remotesList.map((r,i)=>`
+    <div style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;display:flex;flex-direction:column;gap:8px">
+      <div style="display:flex;gap:8px;align-items:center">
+        <input placeholder="Device name" value="${esc(r.name)}" autocomplete="off" spellcheck="false"
+          style="flex:1;font-family:var(--mono);font-size:13px;font-weight:600;min-width:0"
+          oninput="remotesList[${i}].name=this.value;cfgDirty.remotes=true;setupDirty()">
+        <button onclick="removeRemote(${r.index})"
+          style="flex-shrink:0;font-size:12px;padding:3px 10px;border-radius:6px;opacity:0.6">Remove</button>
+      </div>
+      <div style="display:flex;gap:8px">
+        <input placeholder="IP address (optional)" value="${esc(r.ip_override||'')}" autocomplete="off"
+          style="flex:1;font-family:var(--mono);font-size:12px;min-width:0"
+          oninput="remotesList[${i}].ip_override=this.value;cfgDirty.remotes=true;setupDirty()">
+        <input type="password" placeholder="Password (optional)" value="${esc(r.password||'')}"
+          style="flex:1;font-size:12px;min-width:0"
+          oninput="remotesList[${i}].password=this.value||null;cfgDirty.remotes=true;setupDirty()">
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--sub);cursor:pointer">
+        <input type="checkbox" ${r.enabled?'checked':''} onchange="remotesList[${i}].enabled=this.checked;cfgDirty.remotes=true;setupDirty()">
+        Enabled
+      </label>
+    </div>`).join('');
+}
+
+function updateMode(){}
 function nodeNameDirty(){cfgDirty.node=true;setupDirty()}
 function saveNodeName(){const n=$('cfgNode').value.trim();if(!n)return;savedNodeName=n;$('nodeLine').textContent=n}
-function togglePw(){const f=$('cfgLinkPw'),b=$('pwToggleBtn');f.type=f.type==='password'?'text':'password';b.textContent=f.type==='password'?'Show':'Hide'}
-async function applySetup(){const btn=$('applyBtn');if(btn.classList.contains('done'))return;if(btn.classList.contains('arm')){clearTimeout(btn._armTimer);btn.classList.remove('arm');btn.disabled=true;btn.textContent='Rebuilding…';const body={remote:$('cfgPeer').value||'',remote_device_name:$('cfgRemoteName').value||'',link_password:$('cfgLinkPw').value||undefined,node_id:$('cfgNode').value||savedNodeName,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value)||2,opus_bitrate_per_channel:Number($('bitrate').value)||128000,receive_buffer_ms:Number($('rxBuffer').value)||120,rendezvous_url:$('cfgRendezvous').value||undefined,phase_lock:$('cfgPhaseLock').checked,encoder_mode:$('cfgEncoderMode').value,bind_addr:$('cfgInterface').value||'0.0.0.0',selected_input_device:$('cfgInputDevice').value||undefined,selected_output_device:$('cfgOutputDevice').value||undefined};try{const res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const txt=await res.text();if(res.ok){clearSetupDirty();btn.textContent='✓ Engine rebuilding';btn.classList.add('done');btn.disabled=false;setTimeout(()=>{btn.classList.remove('done');btn.textContent='Apply & rebuild engine'},3000)}else{btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+txt)}}catch(e){btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+e)}}else{btn.classList.add('arm');btn.textContent='Confirm rebuild';btn._armTimer=setTimeout(()=>{btn.classList.remove('arm');btn.textContent='Apply & rebuild engine'},3000)}}
-function updateSetupFromStatus(){if(!cfgDirty.node){$('cfgNode').value=status.node_id||'';if(!savedNodeName)savedNodeName=status.node_id||''}if(!cfgDirty.remoteName)$('cfgRemoteName').value=status.runtime?.remote_device_name||'';if(!cfgDirty.peer)$('cfgPeer').value=(status.runtime?.remote_host||'').split(':')[0];$('cfgRendezvous').value=status.runtime?.rendezvous_url||'https://audiolink.amsound.co.uk';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels||2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel||128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms||120);if(!cfgDirty.encoderMode)setSelectValue('cfgEncoderMode',status.runtime?.encoder_mode||'music');if(!cfgDirty.phaseLock){const pl=$('cfgPhaseLock');if(pl)pl.checked=status.runtime?.phase_lock!==false}
-  if(!cfgDirty.interface){const s=$('cfgInterface');if(s){const v=status.runtime?.bind_addr||'';if(v&&v!=='0.0.0.0')s.value=v;else s.value=''}}
-  if(!cfgDirty.inputDevice){const s=$('cfgInputDevice');if(s)s.value=status.runtime?.selected_input_device||''}
-  if(!cfgDirty.outputDevice){const s=$('cfgOutputDevice');if(s)s.value=status.runtime?.selected_output_device||''}
-  updateMode()}
+
+function setupDirty(){
+  const btn=$('applyBtn');if(!btn)return;
+  if(Object.values(cfgDirty).some(Boolean))btn.style.display='inline-flex';
+}
+function clearSetupDirty(){
+  Object.keys(cfgDirty).forEach(k=>cfgDirty[k]=false);
+  const btn=$('applyBtn');if(btn){btn.classList.remove('arm','done');btn.textContent='Apply & rebuild engine';btn.disabled=false}
+}
+
+async function applySetup(){const btn=$('applyBtn');if(btn.classList.contains('done'))return;if(btn.classList.contains('arm')){clearTimeout(btn._armTimer);btn.classList.remove('arm');btn.disabled=true;btn.textContent='Rebuilding…';const normRemotes=remotesList.map((r,i)=>({index:i,name:r.name,ip_override:r.ip_override||'',password:r.password||null,channels_to_send:r.channels_to_send,enabled:r.enabled}));const body={remotes:normRemotes,node_id:$('cfgNode').value||savedNodeName,token:$('cfgToken').value||undefined,channels:Number($('cfgChannels').value)||2,opus_bitrate_per_channel:Number($('bitrate').value)||128000,receive_buffer_ms:Number($('rxBuffer').value)||120,rendezvous_url:$('cfgRendezvous').value||undefined,phase_lock:$('cfgPhaseLock').checked,encoder_mode:$('cfgEncoderMode').value,bind_addr:$('cfgInterface').value||'0.0.0.0',selected_input_device:$('cfgInputDevice').value||undefined,selected_output_device:$('cfgOutputDevice').value||undefined};try{const res=await fetch('/api/setup/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});const txt=await res.text();if(res.ok){clearSetupDirty();btn.textContent='✓ Engine rebuilding';btn.classList.add('done');btn.disabled=false;setTimeout(()=>{btn.classList.remove('done');btn.textContent='Apply & rebuild engine'},3000)}else{btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+txt)}}catch(e){btn.disabled=false;btn.classList.remove('arm');btn.textContent='Apply & rebuild engine';alert('Apply failed: '+e)}}else{btn.classList.add('arm');btn.textContent='Confirm rebuild';btn._armTimer=setTimeout(()=>{btn.classList.remove('arm');btn.textContent='Apply & rebuild engine'},3000)}}
+function updateSetupFromStatus(){if(!cfgDirty.node){$('cfgNode').value=status.node_id||'';if(!savedNodeName)savedNodeName=status.node_id||''}$('cfgRendezvous').value=status.runtime?.rendezvous_url||'https://audiolink.amsound.co.uk';if(!cfgDirty.channels)setSelectValue('cfgChannels',status.local_channels||2);if(!cfgDirty.bitrate)setSelectValue('bitrate',status.runtime?.opus_bitrate_per_channel||128000);if(!cfgDirty.rxBuffer)setSelectValue('rxBuffer',status.runtime?.latency_ms||120);if(!cfgDirty.encoderMode)setSelectValue('cfgEncoderMode',status.runtime?.encoder_mode||'music');if(!cfgDirty.phaseLock){const pl=$('cfgPhaseLock');if(pl)pl.checked=status.runtime?.phase_lock!==false}if(!cfgDirty.interface){const si=$('cfgInterface');if(si){const v=status.runtime?.bind_addr||'';if(v&&v!=='0.0.0.0')si.value=v;else si.value=''}}if(!cfgDirty.inputDevice){const si=$('cfgInputDevice');if(si)si.value=status.runtime?.selected_input_device||''}if(!cfgDirty.outputDevice){const so=$('cfgOutputDevice');if(so)so.value=status.runtime?.selected_output_device||''}}
 // ── Signal lamp helpers ──────────────────────────────────────────────────────
 // Returns dBFS for a source from current stats
 function sourceDb(srcId){
@@ -374,9 +377,9 @@ function sourceDb(srcId){
   if(srcId==='ebu:l'){// EBU L: -18dBFS with 250ms silence every 3s
     const pos=(Date.now()%3000);return pos<250?-120:-18}
   if(srcId==='ebu:r')return -18;
-  if(srcId.startsWith('peer:remote:ch:')){const ch=parseInt(srcId.split(':').pop());return(stats.rx_peak_dbfs||[])[ch]??-120}
+  if(srcId.startsWith('peer:')&&srcId.includes(':ch:')){const parts=srcId.split(':');const ri=parseInt(parts[1]);const ch=parseInt(parts[3]);const lch=status.local_channels||2;const slot=ri*lch+ch;return(stats.rx_lamp_dbfs||[])[slot]??-120}
   return -120}
-function lampClass(db){if(db>-10)return'red';if(db>-18)return'orange';if(db>-90)return'green';return''}
+function lampClass(db){if(db>-10)return'red';if(db>-17)return'orange';if(db>-50)return'green';return''}
 // Update all rsig lamps without rebuilding the table
 function updateSignalLamps(){
   document.querySelectorAll('[data-src-id]').forEach(el=>{
@@ -385,44 +388,111 @@ function updateSignalLamps(){
 // ── Home render ──────────────────────────────────────────────────────────────
 function render(){
   const st=status.peer_status||'gray';
-  const remote=status.remote||{};
-  const badge=$('connBadge'),lamp=$('peerLamp'),pt=$('peerText');
-  if(st==='green'){badge.className='conn-badge green';lamp.className='lamp green';pt.textContent='Connected — '+(remote.node_id||'remote device');$('alertbar').className='alertbar'}
-  else if(st==='orange'){badge.className='conn-badge orange';lamp.className='lamp orange';pt.textContent='Remote device degraded';$('alertbar').className='alertbar degraded show';$('alertbar').textContent='REMOTE DEVICE DEGRADED'}
-  else{badge.className='conn-badge gray';lamp.className='lamp gray';pt.textContent='No connected device';$('alertbar').className='alertbar offline show';$('alertbar').textContent='REMOTE DEVICE OFFLINE'}
-  $('localName').textContent=status.node_id||'—';$('nodeLine').textContent=status.node_id||'—';
-  $('localCh').textContent=(status.local_channels||0)+' ch';$('localBr').textContent=status.runtime?.opus_bitrate_per_channel?Math.round(status.runtime.opus_bitrate_per_channel/1000)+' kb/s':'—';
-  $('localCodec').textContent=status.runtime?.encoder_mode||'music';
-  const plc=$('localPl');if(status.runtime?.phase_lock!==false){plc.textContent='phase lock';plc.className='nsub-chip live'}else{plc.textContent='no phase lock';plc.className='nsub-chip'}
-  const rn=$('remoteNameHome');
-  if(st!=='gray'){rn.textContent=remote.node_id||status.runtime?.remote_device_name||'—';rn.style.color='var(--ink)';const chips=[];if((remote.channels||0)>0)chips.push(remote.channels+' ch');$('remoteChips').innerHTML=chips.map(ch=>`<span class="nsub-chip">${esc(ch)}</span>`).join('')}
-  else{rn.textContent='—';rn.style.color='var(--muted)';$('remoteChips').innerHTML=''}
-  const rttDisplay=stats.rtt_ms||0;$('rttVal').innerHTML=rttDisplay.toFixed(1)+'<span class="u"> ms</span>';
-  $('txBw').textContent=(stats.tx_mbps||0).toFixed(3);$('rxBw').textContent=(stats.rx_mbps||0).toFixed(3);
-  const loss=stats.loss_percent||0;$('lossVal').innerHTML=loss.toFixed(2)+'<span class="u"> %</span>';$('lossVal').className='sval '+lossCls(loss);
-  const jit=stats.jitter_ms||0;$('jitterVal').innerHTML=jit.toFixed(1)+'<span class="u"> ms</span>';$('jitterVal').className='sval '+(jit>20?'warn':'ok');
-  // Buffer bar
-  const fill=stats.fill_ms||0,target=stats.target_ms||status.runtime?.latency_ms||120,MAX=target*2;
-  const fp=Math.min(100,fill/MAX*100),tp=Math.min(100,target/MAX*100);
-  const bf=$('bufFill');bf.style.width=fp+'%';
-  bf.className='buffill'+(fill<20?' bad':fill<60?' warn':'');
-  $('bufTick').style.left=tp+'%';
-  // Position the legend target label at the same % as the tick
-  const lbl=$('bufTickLbl');if(lbl){lbl.textContent=target+' ms';lbl.style.left=tp+'%'}
-  $('fillMs').textContent=Number.isFinite(fill)?Math.round(fill):fill;$('targetMs').textContent=target;const blm=$('bufLegMax');if(blm)blm.textContent=MAX+' ms';
-  $('tMode').textContent=status.runtime?.remote_host?'direct IP':(status.runtime?.remote_device_name?'cloud':'passive');$('tHost').textContent=status.runtime?.remote_host||(status.discovered_peer_addr?status.discovered_peer_addr+' (via cloud)':'—');
-  function diagVal(id,text,cls){const el=$(id);if(!el)return;el.textContent=text;el.style.color=cls==='bad'?'var(--red)':cls==='warn'?'var(--orange)':'';}
-  diagVal('dRtt',(stats.rtt_ms||0).toFixed(1)+' ms','');
-  diagVal('dOwLat',(stats.one_way_latency_ms||0).toFixed(1)+' ms (RTT/2)','');
-  const d=stats.drift_pressure_ppm||0;$('dDrift').textContent=(d>=0?'+':'')+d+' ppm';
-  $('dFps').textContent=(stats.decoded_fps||0).toFixed(1);$('dTxFps').textContent=(stats.tx_fps||0).toFixed(1);
-  $('dQ').textContent=stats.queued_groups||0;
-  diagVal('dOv',stats.ring_overflows||0,(stats.ring_overflows||0)>0?'warn':'');
-  diagVal('dPlc',stats.plc_channels||0,(stats.plc_channels||0)>0?'warn':'');
-  diagVal('dMiss',stats.seq_missing||0,(stats.seq_missing||0)>2?'bad':(stats.seq_missing||0)>0?'warn':'');
-  $('dSug').textContent=stats.recommended_buffer_ms?stats.recommended_buffer_ms+' ms':'—';
-  diagVal('dUf',stats.output_underflows||0,(stats.output_underflows||0)>0?'warn':'');
-  $('dUp').textContent=(status.uptime_seconds||0)+' s';
+  $('nodeLine').textContent=status.node_id||'—';
+
+  // ── This device card ──────────────────────────────────────────────────────
+  const rt=status.runtime||{};
+  const deviceIp=status.device_ip||'';
+  $('deviceIpLine').textContent=[(status.node_id||''),deviceIp].filter(Boolean).join(' · ');
+  const chips=[];
+  if(status.local_channels)chips.push(status.local_channels+' ch');
+  if(rt.opus_bitrate_per_channel)chips.push(Math.round(rt.opus_bitrate_per_channel/1000)+' kb/s');
+  if(rt.encoder_mode)chips.push(rt.encoder_mode);
+  if(rt.phase_lock!==false)chips.push('phase lock');
+  if(rt.latency_ms)chips.push(rt.latency_ms+'ms buffer');
+  $('thisDeviceChips').innerHTML=chips.map(c=>`<span class="nsub-chip">${esc(c)}</span>`).join('');
+
+  // ── Connections card ──────────────────────────────────────────────────────
+  const remotes=status.remotes||[];
+  const connRows=$('connectionRows');
+  const rowKey=remotes.map(r=>r.index+'_'+r.status+'_'+(r.channels||0)).join('|');
+  // Update dynamic values in-place — prevents ▸ more from closing on each tick
+  remotes.forEach(r=>{
+    const row=connRows.querySelector('[data-ridx="'+r.index+'"]');
+    if(!row)return;
+    const bv=row.querySelector('.buf-val');
+    if(bv&&r.fill_ms!=null){
+      const MAX=(r.target_ms||100)*2,pct=Math.min(100,r.fill_ms/MAX*100);
+      const clr=r.fill_ms<(r.target_ms||100)*0.6?'#EF9F27':'#1D9E75';
+      bv.textContent=Math.round(r.fill_ms)+'ms';
+      bv.className='csv buf-val '+(r.fill_ms<(r.target_ms||100)*0.6?'warn':'ok');
+      const fill=row.querySelector('.hbuf-fill');if(fill){fill.style.width=pct+'%';fill.style.background=clr;}
+    }
+  });
+  if(connRows.dataset.key!==rowKey){
+    connRows.dataset.key=rowKey;
+    const stClr={green:'#1D9E75',orange:'#EF9F27',gray:'#B4B2A9'};
+    const lossCl=l=>l==null?'muted':l>0?'warn':'ok';
+    const jitCl=j=>j==null?'muted':j>25?'warn':'ok';
+    const fmt=(v,dec,unit)=>v==null?'—':(+v).toFixed(dec)+(unit||'');
+    const bufBar=(fill,target)=>{
+      if(fill==null||target==null)return`<div class="hbuf-track"><div class="hbuf-mid"></div></div>`;
+      const MAX=target*2,pct=Math.min(100,fill/MAX*100);
+      const clr=fill<target*0.6?'#EF9F27':'#1D9E75';
+      return`<div class="hbuf-track"><div class="hbuf-fill" style="width:${pct}%;background:${clr}"></div><div class="hbuf-mid"></div></div>`;
+    };
+    let html='';
+    remotes.forEach((r,i)=>{
+      const offline=r.status==='gray';
+      const ipLine=r.ip_override&&r.ip_override.trim()?r.ip_override:'Cloud rendezvous';
+      const diagId='diag_'+r.index;
+      const diag=!offline?`
+        <div class="diag-row">
+          <span class="diag-item"><span class="dl">Drift</span><span class="dv">${fmt(r.drift_ppm,0,'ppm')}</span></span>
+          <span class="diag-item"><span class="dl">Dec fps</span><span class="dv">${fmt(r.decoded_fps,1)}</span></span>
+          <span class="diag-item"><span class="dl">TX fps</span><span class="dv">${fmt(r.tx_fps,1)}</span></span>
+          <span class="diag-item"><span class="dl">Queued</span><span class="dv">${r.queued??'—'}</span></span>
+          <span class="diag-item"><span class="dl">PLC ch</span><span class="dv">${r.plc_ch??'—'}</span></span>
+          <span class="diag-item"><span class="dl">Missing</span><span class="dv">${r.seq_missing??'—'}</span></span>
+          <span class="diag-item"><span class="dl">Overflows</span><span class="dv">${r.ring_overflows??'—'}</span></span>
+          <span class="diag-item"><span class="dl">Underflows</span><span class="dv">${r.underflows??'—'}</span></span>
+        </div>`:'';
+      html+=`
+        ${i>0?'<hr class="conn-divider">':''}
+        <div class="conn-row${offline?' conn-offline':''}" style="display:flex;gap:10px;align-items:flex-start">
+          <span class="conn-dot" style="background:${stClr[r.status]||stClr.gray};margin-top:3px"></span>
+          <div style="flex:1;min-width:0">
+            <div class="conn-name">${esc(r.name||'—')}</div>
+            <div class="conn-sub">${r.channels||0} ch · ${esc(rt.encoder_mode||'music')} · ${rt.opus_bitrate_per_channel?Math.round(rt.opus_bitrate_per_channel/1000)+' kb/s':'—'}</div>
+            <div class="conn-sub">${esc(ipLine)}${offline?' · Not connected':''}</div>
+            ${!offline?`<div class="conn-more" onclick="var d=document.getElementById('${diagId}');var o=d.style.display!=='none';d.style.display=o?'none':'block';this.textContent=o?'▸ more':'▾ hide'">▸ more</div>`:''}
+            <div id="${diagId}" style="display:none">${diag}</div>
+          </div>
+          <div class="conn-stats">
+            <div class="cst"><div class="csl">RTT</div><div class="csv">${fmt(r.rtt_ms,1,'ms')}</div></div>
+            <div class="cst"><div class="csl">Loss</div><div class="csv ${lossCl(r.loss_percent)}">${fmt(r.loss_percent,2,'%')}</div></div>
+            <div class="cst"><div class="csl">Jitter</div><div class="csv ${jitCl(r.jitter_ms)}">${fmt(r.jitter_ms,1,'ms')}</div></div>
+            <div class="cst cst-wide">
+              <div class="csl">Buffer</div>
+              <div class="csv buf-val ${r.fill_ms!=null?(r.fill_ms<(r.target_ms||0)*0.6?'warn':'ok'):'muted'}">${fmt(r.fill_ms,0,'ms')}</div>
+              ${bufBar(r.fill_ms,r.target_ms)}
+            </div>
+          </div>
+        </div>`;
+    });
+    const totalTx=(stats.tx_mbps||0).toFixed(3);
+    const totalRx=(stats.rx_mbps||0).toFixed(3);
+    const up=status.uptime_seconds||0;
+    const upStr=up>3600?Math.floor(up/3600)+'h '+Math.floor((up%3600)/60)+'m':up>60?Math.floor(up/60)+'m '+up%60+'s':up+'s';
+    html+=`
+      <hr class="conn-divider">
+      <div style="display:flex;justify-content:flex-end">
+        <div class="conn-agg">
+          <div class="cst"><div class="csl">TX total</div><div class="csv">${totalTx} Mb/s</div></div>
+          <div class="cst"><div class="csl">RX total</div><div class="csv">${totalRx} Mb/s</div></div>
+          <div class="cst"><div class="csl">Uptime</div><div class="csv">${upStr}</div></div>
+        </div>
+      </div>`;
+    if(!remotes.length)html='<div style="font-size:12px;color:var(--muted);padding:4px 0">No remotes configured</div>';
+    // Save expanded diagnostics state before rebuild, restore after
+    const openDiags=new Set([...connRows.querySelectorAll('[id^="diag_"]')].filter(d=>d.style.display!=='none').map(d=>d.id));
+    connRows.innerHTML=html;
+    openDiags.forEach(id=>{const d=document.getElementById(id);if(d){d.style.display='block';const btn=d.previousElementSibling;if(btn&&btn.classList.contains('conn-more'))btn.textContent='▾ hide';}});
+  }
+
+  // Update header badge (aggregate)
+  // header badge removed - status shown per-remote on home card
+
   renderMeters();updateSetupFromStatus();updateSignalLamps()}
 // ── Meters ───────────────────────────────────────────────────────────────────
 const DB_FLOOR=-60,DB_RANGE=60,DB_G=-18,DB_O=-10;
@@ -432,6 +502,7 @@ function makeMeter(lbl,key,ticks){const t=ticks?`<div class="barticks"><div clas
 function updateMeter(key,db){const{g,o,r}=segH(db);const G=$('sg_'+key),O=$('so_'+key),R=$('sr_'+key),D=$('mdb_'+key);if(!G)return;G.style.height=g+'%';G.style.bottom='0';O.style.height=o+'%';O.style.bottom=g+'%';R.style.height=r+'%';R.style.bottom=(g+o)+'%';if(D)D.textContent=db>-100?db.toFixed(1):'−∞'}
 function renderMeters(){
   const txPeaks=stats.tx_peak_dbfs||[];const rxPeaks=stats.rx_peak_dbfs||[];const monPeaks=stats.monitor_peak_dbfs||[-120,-120];
+  const statusRemotes=status.remotes||[];
   const connected=(status.peer_status==='green'||status.peer_status==='orange');
   const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');
   const rxSrcs=connected?(matrix.sources||[]).filter(s=>s.kind==='network_receive'):[];
@@ -439,8 +510,25 @@ function renderMeters(){
   const txBank=$('txMeters'),rxBank=$('rxMeters'),monBank=$('monMeters');if(!txBank)return;
   const txKey='tx'+txN+(txDests.map(d=>d.label).join('|'));
   if(txBank.dataset.key!==txKey){txBank.innerHTML=txDests.map((d,i)=>{const lbl=d.label.replace(/^Send \d+ — /,'');return makeMeter('Ch '+(i+1)+(lbl?' — '+lbl:''),`tx${i}`,i===0)}).join('')||makeMeter('Ch 1','tx0',true);txBank.dataset.key=txKey}
-  if(rxBank.dataset.key!==String(rxN)){rxBank.innerHTML=rxN>0?Array.from({length:rxN},(_,i)=>makeMeter('Ch '+(i+1),`rx${i}`,i===0)).join(''):'<div style="color:var(--muted);font-size:12px;padding:8px 0">No connected remote device</div>';rxBank.dataset.key=String(rxN)}
-  if(!monBank.children.length){monBank.innerHTML=makeMeter('L','mn0',true)+makeMeter('R','mn1',false)}
+  const rxKey=rxN+'|'+(statusRemotes.map(r=>r.name+'@'+r.channels).join(','));
+  if(rxBank.dataset.key!==rxKey){
+    if(rxN===0){rxBank.innerHTML='<div style="color:var(--muted);font-size:12px;padding:8px 0">No connected remote device</div>';}
+    else if(statusRemotes.length>1){
+      // Multi-remote: group meters by remote with label strip
+      let html='';let slot=0;
+      statusRemotes.forEach(r=>{
+        const rch=r.channels||0;if(rch===0)return;
+        html+=`<div style="margin-bottom:10px"><div style="font-size:11px;color:var(--sub);margin-bottom:4px;font-weight:600">${esc(r.name)}</div><div style="display:flex;gap:4px">`
+        for(let i=0;i<rch;i++){html+=makeMeter('Ch '+(i+1),'rx'+slot,i===0);slot++;}
+        html+='</div></div>';
+      });
+      rxBank.innerHTML=html;
+    } else {
+      rxBank.innerHTML=Array.from({length:rxN},(_,i)=>makeMeter('Ch '+(i+1),`rx${i}`,i===0)).join('');
+    }
+    rxBank.dataset.key=rxKey;
+  }
+  if(!monBank.children.length){monBank.innerHTML=makeMeter('Out 1','mn0',true)+makeMeter('Out 2','mn1',false)}
   txPeaks.forEach((v,i)=>updateMeter('tx'+i,v));rxPeaks.forEach((v,i)=>updateMeter('rx'+i,v));[monPeaks[0]??-120,monPeaks[1]??-120].forEach((v,i)=>updateMeter('mn'+i,v))}
 // ── Hover highlight ──────────────────────────────────────────────────────────
 function setupHover(tableId){const tbl=$(tableId);if(!tbl)return;let pRow=null,pCols=[];function clear(){if(pRow)pRow.classList.remove('hl-row');pCols.forEach(c=>c.classList.remove('hl-col'));pRow=null;pCols=[]}tbl.addEventListener('mouseover',e=>{const cell=e.target.closest('td,th');if(!cell)return;clear();const tr=cell.parentElement;if(tr.parentElement.tagName==='TBODY'){tr.classList.add('hl-row');pRow=tr}const col=cell.cellIndex;const cols=Array.from(tbl.querySelectorAll(`tr>*:nth-child(${col+1})`));cols.forEach(c=>c.classList.add('hl-col'));pCols=cols});tbl.addEventListener('mouseleave',clear)}
@@ -536,7 +624,7 @@ function doTx1to1(){
   for(let i=0;i<n;i++)routes.push({source:txSrcsReg[i].id,destination:txDests[i].id});
   fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(async m=>{matrix=m;matrixLastKey='';buildMatrices();await pushAllLabels()}).catch(console.error)}
 function doTxClear(){
-  const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('input:'));
+  const routes=(matrix.routes||[]).filter(r=>!r.destination.startsWith('stream:'));
   fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(async m=>{matrix=m;matrixLastKey='';buildMatrices();await pushAllLabels()}).catch(console.error)}
 // ── Receive routing ──────────────────────────────────────────────────────────
 function doResetLabels(){Object.keys(srcUserLabels).forEach(k=>delete srcUserLabels[k]);const txDests=(matrix.destinations||[]).filter(d=>d.kind==='network_send');const labels=txDests.map(()=>'');fetch('/api/local-labels',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({labels})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
@@ -568,12 +656,12 @@ function buildRxTable(){
 function doRx1to1(){
   const rxSrcs=(matrix.sources||[]).filter(s=>s.kind==='network_receive');
   const rxDests=(matrix.destinations||[]).filter(d=>d.kind==='physical_output');
-  const nonRx=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));
+  const nonRx=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:'));
   const routes=[...nonRx];const n=Math.min(rxSrcs.length,rxDests.length);
   for(let i=0;i<n;i++)routes.push({source:rxSrcs[i].id,destination:rxDests[i].id});
   fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes,monitor_mode:'patch_matrix'})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
 function doRxClear(){
-  const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:remote:'));
+  const routes=(matrix.routes||[]).filter(r=>!r.source.startsWith('peer:'));
   fetch('/api/routes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({routes})}).then(r=>r.json()).then(m=>{matrix=m;matrixLastKey='';buildMatrices()}).catch(console.error)}
 // ── Matrix key + build ───────────────────────────────────────────────────────
 function matrixKey(){return JSON.stringify({p:status.peer_status||'gray',s:(matrix.sources||[]).map(s=>s.id+s.kind+s.label),d:(matrix.destinations||[]).map(d=>d.id+d.label),r:(matrix.routes||[]).map(r=>r.source+r.destination).sort()})}
@@ -628,13 +716,23 @@ async function poll(){
 // the values correctly without overriding anything the user has typed.
 fetch('/api/config').then(r=>r.json()).then(cfg=>{
   const co=cfg.config||{};
-  if(co.remote_device_name&&!cfgDirty.remoteName)$('cfgRemoteName').value=co.remote_device_name;
-  if(co.remote&&!cfgDirty.peer)$('cfgPeer').value=co.remote;
+  if(!cfgDirty.remotes){
+    const saved=co.remotes||[];
+    if(saved.length>0){
+      remotesList=saved.map(r=>({index:r.index,name:r.name||'',ip_override:r.ip_override||'',password:r.password||null,channels_to_send:r.channels_to_send||[],enabled:r.enabled!==false}));
+      nextRemoteIndex=Math.max(...remotesList.map(r=>r.index))+1;
+    }else if(co.remote_device_name){
+      remotesList=[{index:0,name:co.remote_device_name,ip_override:co.remote||'',password:co.link_password||null,channels_to_send:[],enabled:true}];
+      nextRemoteIndex=1;
+    }
+    renderRemotes();
+  }
   if(co.bind_addr&&co.bind_addr!=='0.0.0.0'&&!cfgDirty.interface&&$('cfgInterface'))$('cfgInterface').value=co.bind_addr;
   if(co.selected_input_device&&!cfgDirty.inputDevice&&$('cfgInputDevice'))$('cfgInputDevice').value=co.selected_input_device;
   if(co.selected_output_device&&!cfgDirty.outputDevice&&$('cfgOutputDevice'))$('cfgOutputDevice').value=co.selected_output_device;
 }).catch(console.error);
 fetch('/api/audio/devices').then(r=>r.json()).then(d=>{devices=d;renderDevices();populateDeviceDropdowns(d)}).catch(console.error);
+fetch('/api/device-ip').then(r=>r.json()).then(d=>{status.device_ip=(d.interfaces&&d.interfaces[0]&&d.interfaces[0].addr)||d.addr||d.ip||''}).catch(()=>{});
 fetch('/api/interfaces').then(r=>r.json()).then(populateInterfaces).catch(console.error);
 poll();setInterval(poll,200);
 </script>

@@ -18,10 +18,6 @@ pub fn rtp_seq_looks_reset(prev: u16, next: u16) -> bool {
     prev != next && prev.wrapping_sub(next) < 0x8000
 }
 
-pub fn latency_ms_to_samples(ms: u32) -> u32 {
-    ((ms as u64 * SAMPLE_RATE as u64) / 1000) as u32
-}
-
 pub fn effective_receive_buffer_ms(configured_ms: u32) -> u32 {
     configured_ms
         .clamp(MIN_LATENCY_MS, MAX_LATENCY_MS)
@@ -44,10 +40,12 @@ pub struct FrameGroup {
     pub packets: Vec<Option<Vec<u8>>>,
     pub expected: HashSet<u8>,
     pub received_at: Instant,
+    /// Per-group timeout derived from measured jitter at group creation time.
+    timeout: Duration,
 }
 
 impl FrameGroup {
-    pub fn new(_timestamp: u32, expected_channels: usize) -> Self {
+    pub fn new(_timestamp: u32, expected_channels: usize, timeout_ms: u64) -> Self {
         let expected = (0..expected_channels.min(MAX_CHANNELS))
             .map(|ch| ch as u8)
             .collect();
@@ -55,6 +53,7 @@ impl FrameGroup {
             packets: vec![None; MAX_CHANNELS],
             expected,
             received_at: Instant::now(),
+            timeout: Duration::from_millis(timeout_ms),
         }
     }
 
@@ -69,7 +68,7 @@ impl FrameGroup {
     }
 
     pub fn timed_out(&self) -> bool {
-        self.received_at.elapsed() >= Duration::from_millis(PHASE_LOCK_TIMEOUT_MS)
+        self.received_at.elapsed() >= self.timeout
     }
 }
 

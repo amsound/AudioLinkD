@@ -62,11 +62,6 @@ fn main() -> Result<()> {
     match mode {
         "bidir" | "bidirectional" => run_bidir_from_args(&args),
         "help"  | "--help" | "-h" => { print_usage(); Ok(()) }
-        // Legacy modes removed — use bidir
-        "send" | "recv" | "echo" => {
-            eprintln!("Legacy mode '{mode}' removed — use 'bidir' instead");
-            print_usage(); std::process::exit(1);
-        }
         _ => { eprintln!("Unknown mode '{mode}'"); print_usage(); std::process::exit(1); }
     }
 }
@@ -76,9 +71,14 @@ fn main() -> Result<()> {
 fn run_bidir_from_args(args: &[String]) -> Result<()> {
     let saved = load_persisted_state().config;
 
-    // Parse args, with persisted values as fallback
-    let mut remote_host = String::new();
-    let mut remote_device_name = saved.remote_device_name.clone().unwrap_or_default();
+    // Parse args, with persisted values as fallback.
+    let first_remote = saved.remotes.first();
+    let mut remote_host = first_remote
+        .map(|r| r.ip_override.clone())
+        .unwrap_or_default();
+    let mut remote_device_name = first_remote
+        .map(|r| r.name.clone())
+        .unwrap_or_default();
     let mut node_id  = saved.node_id.clone().unwrap_or_else(default_node_id);
     let mut channels: usize = saved.channels.unwrap_or(2);
     let mut bitrate: u32 = saved.opus_bitrate_per_channel.unwrap_or(128_000);
@@ -91,7 +91,8 @@ fn run_bidir_from_args(args: &[String]) -> Result<()> {
     let mut no_recv = false;
     let mut explicit_token: Option<[u8; 16]> = saved.token_hex.as_deref()
         .and_then(|h| parse_token_arg(h).ok());
-    let mut link_password: Option<String> = saved.link_password.clone();
+    let mut link_password: Option<String> = first_remote
+        .and_then(|r| r.password.clone());
     let mut rendezvous_url: Option<String> = saved.rendezvous_url.clone();
     let mut encoder_mode: EncoderMode = saved.encoder_mode.unwrap_or_default();
     let mut bind_addr: String = saved.bind_addr.clone().unwrap_or_else(|| "0.0.0.0".to_string());
@@ -205,15 +206,27 @@ fn run_bidir_from_args(args: &[String]) -> Result<()> {
         Some(format!("0.0.0.0:{}", web_port.unwrap_or(8080)))
     };
 
+    let remotes = if !saved.remotes.is_empty() {
+        saved.remotes.clone()
+    } else if !remote_device_name.is_empty() {
+        vec![crate::persistence::RemoteConnection {
+            index: 0,
+            name: remote_device_name.clone(),
+            ip_override: remote_host.clone(),
+            password: link_password.clone(),
+            channels_to_send: (0..channels).collect(),
+            enabled: true,
+        }]
+    } else {
+        vec![]
+    };
     run_bidir(
-        &remote_host, &remote_device_name, channels,
-        !no_send, !no_recv, device_name_token, shared_token, node_id, jitter,
+        remotes, channels,
+        !no_send, !no_recv, device_name_token, node_id, jitter,
         web_addr, bitrate, rendezvous_url, encoder_mode, bind_addr,
         selected_input_device, selected_output_device,
     )
 }
-
-// ─── Legacy modes ────────────────────────────────────────────────────────────
 
 fn print_usage() {
     println!(
@@ -221,9 +234,6 @@ fn print_usage() {
 
 USAGE:
   audiolinkd bidir [OPTIONS]             Bidirectional audio (default)
-  audiolinkd send  <host> [ch] [bps]     Legacy send-only
-  audiolinkd recv  [ch] [latency_ms]     Legacy receive-only
-  audiolinkd echo                        UDP echo test
 
 BIDIR OPTIONS:
   --remote-host <host>      Remote IP or hostname

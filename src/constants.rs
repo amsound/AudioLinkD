@@ -28,7 +28,6 @@ pub const CAP_RING_SIZE: usize = (SAMPLE_RATE as usize * 200) / 1000;
 pub const PB_RING_SIZE: usize = SAMPLE_RATE as usize;
 
 pub const REPRIME_AFTER_EMPTY_CALLBACKS: u32 = 30;
-pub const UNDERRUN_DECAY: f32 = 0.9;
 pub const CROSSFADE_SAMPLES: usize = 64;
 
 // EBU R49 line-up tone: 1 kHz at -18 dBFS peak.
@@ -37,4 +36,3 @@ pub const TONE_AMPLITUDE: f32 = 0.125_892_54;
 pub const TX_SRC_EBU_L: usize = 100;
 pub const TX_SRC_EBU_R: usize = 101;
 pub const TX_SRC_INPUT_BASE: usize = 1000;
-pub const TX_SRC_SILENT: usize = usize::MAX;
