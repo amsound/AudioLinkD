@@ -20,16 +20,6 @@ pub fn make_encoder_for_mode(bitrate: u32, mode: EncoderMode) -> Result<opus::En
     Ok(enc)
 }
 
-pub fn make_encoder_with_bitrate(bitrate: u32) -> Result<opus::Encoder> {
-    make_encoder_for_mode(bitrate, EncoderMode::default())
-}
-
-pub fn make_encoder() -> Result<opus::Encoder> {
-    make_encoder_with_bitrate(128_000)
-}
-
-// ─── Decoder / resampler banks ───────────────────────────────────────────────
-
 pub fn fresh_opus_decoders() -> Vec<opus::Decoder> {
     (0..MAX_CHANNELS)
         .map(|_| opus::Decoder::new(SAMPLE_RATE, opus::Channels::Mono).unwrap())
@@ -49,27 +39,6 @@ pub fn fresh_asrc_resamplers() -> Vec<FastFixedIn<f32>> {
 /// Odd-indexed channels (0, 2, 4…) → L; even-indexed (1, 3, 5…) → R.
 /// Sum divided by contributor count per side to prevent clipping.
 /// N=1: mono copied to both L and R at unity.
-pub fn mixdown(channels: &[Vec<f32>], out: &mut [f32]) {
-    let n = channels.len();
-    assert_eq!(out.len(), FRAME_SAMPLES * 2);
-    if n == 0 { out.fill(0.0); return; }
-    if n == 1 {
-        for (i, s) in channels[0].iter().enumerate() {
-            out[i * 2] = *s; out[i * 2 + 1] = *s;
-        }
-        return;
-    }
-    for i in 0..FRAME_SAMPLES {
-        let mut l = 0.0f32; let mut r = 0.0f32;
-        for (ch, buf) in channels.iter().enumerate() {
-            if ch % 2 == 0 { l += buf[i]; } else { r += buf[i]; }
-        }
-        out[i * 2] = l; out[i * 2 + 1] = r;
-    }
-}
-
-// ─── Re-prime logic ───────────────────────────────────────────────────────────
-
 pub fn handle_underrun(
     all_empty: bool,
     started: &std::sync::atomic::AtomicBool,
@@ -90,21 +59,6 @@ pub fn handle_underrun(
 
 // ─── Decode with PLC ─────────────────────────────────────────────────────────
 
-pub fn decode_or_plc(decoder: &mut opus::Decoder, payload: Option<&[u8]>, pcm: &mut [f32]) -> bool {
-    match payload {
-        Some(data) if decoder.decode_float(data, pcm, false).is_ok() => true,
-        _ => {
-            if decoder.decode_float(&[], pcm, true).is_err() { pcm.fill(0.0); }
-            false
-        }
-    }
-}
-
-/// Decode or PLC with a linear crossfade at real/concealed boundaries.
-///
-/// Maintains a tail buffer of the last CROSSFADE_SAMPLES real decoded samples.
-/// On real→PLC: fades from real tail into PLC output — eliminates the click.
-/// On PLC→real: short fade-in on the first real frame back.
 pub fn decode_or_plc_xfade(
     decoder: &mut opus::Decoder,
     payload: Option<&[u8]>,

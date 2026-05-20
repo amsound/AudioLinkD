@@ -48,50 +48,130 @@ fn udp_disconnect_socket(socket: &UdpSocket) -> std::io::Result<()> {
     { let _ = socket; Ok(()) }
 }
 
-// ─── run_bidir ────────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-pub fn run_bidir(
-    remote_host: &str,
-    remote_device_name: &str,
-    num_channels: usize,
-    send_enabled: bool,
-    recv_enabled: bool,
-    device_name_token: [u8; 16],
+// ─── Packet demux ─────────────────────────────────────────────────────────────
+
+struct DemuxEntry {
     shared_token: [u8; 16],
-    node_id: String,
-    jitter: JitterConfig,
-    web_addr: Option<String>,
-    opus_bitrate_per_channel: u32,
-    rendezvous_url: Option<String>,
-    encoder_mode: EncoderMode,
-    bind_addr: String,
-    selected_input_device: Option<String>,
-    selected_output_device: Option<String>,
-) -> Result<()> {
-    if num_channels == 0 || num_channels > MAX_CHANNELS {
-        return Err(anyhow!("Channel count must be 1–{MAX_CHANNELS}"));
-    }
-    let is_initiator = !remote_host.trim().is_empty();
-    let remote_addr_str = format!("{remote_host}:{PORT}");
+    tx: std::sync::mpsc::SyncSender<(usize, std::net::SocketAddr, Vec<u8>)>,
+}
 
-    let socket = {
-        let mut sock = None;
-        let mut last_err = None;
-        for attempt in 0..10 {
-            match UdpSocket::bind(format!("{bind_addr}:{PORT}")) {
-                Ok(s) => { sock = Some(Arc::new(s)); break; }
-                Err(e) => {
-                    if attempt > 0 { tracing::warn!("Port {PORT} busy (attempt {}/10), retrying…", attempt + 1); }
-                    last_err = Some(e);
-                    std::thread::sleep(Duration::from_millis(500));
-                }
+fn spawn_packet_demux(socket: Arc<UdpSocket>, sessions: Vec<DemuxEntry>) {
+    std::thread::spawn(move || {
+        let mut addr_map: HashMap<std::net::SocketAddr, usize> = HashMap::new();
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, src) = match socket.recv_from(&mut buf) {
+                Ok(r) => r,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                       || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(e) => { tracing::error!("demux recv_from: {e}"); continue; }
+            };
+            if let Some(&idx) = addr_map.get(&src) {
+                let _ = sessions[idx].tx.try_send((n, src, buf[..n].to_vec()));
+                continue;
+            }
+            let matched = parse_handshake_packet(&buf[..n]).and_then(|pkt| {
+                let tok = match pkt {
+                    HandshakePacket::Probe { expected_peer, .. } => expected_peer,
+                    HandshakePacket::Accept { token } | HandshakePacket::Confirm { token } => token,
+                    _ => return None,
+                };
+                sessions.iter().position(|e| e.shared_token == tok)
+            });
+            if let Some(idx) = matched {
+                addr_map.insert(src, idx);
+                let _ = sessions[idx].tx.try_send((n, src, buf[..n].to_vec()));
             }
         }
-        sock.ok_or_else(|| anyhow!("Could not bind {bind_addr}:{PORT}: {}", last_err.unwrap()))?
-    };
-    if is_initiator { socket.connect(&remote_addr_str)?; }
-    tracing::info!("Bound to {bind_addr}:{PORT}");
+    });
+}
+
+// ─── Remote session ───────────────────────────────────────────────────────────
+
+/// Static configuration for one remote peer session.
+/// Passed by value into `run_remote_session`; cheaply cloneable.
+struct RemoteSessionConfig {
+    remote_host:        String,
+    remote_device_name: String,
+    is_initiator:       bool,
+    shared_token:       [u8; 16],
+    device_name_token:  [u8; 16],
+    node_id:            String,
+    num_channels:       usize,
+    jitter:             JitterConfig,
+    rendezvous_url:     Option<String>,
+    #[allow(dead_code)]
+    bind_addr:          String,
+    prime_samples:      usize,
+    recv_enabled:       bool,
+    channels_to_send:   Vec<usize>,
+    /// Flat ring-buffer slot offset for this remote.
+    /// Remote at index i uses ring slots [rx_channel_offset .. rx_channel_offset + num_channels].
+    rx_channel_offset:  usize,
+}
+
+/// Shared atomic state returned by `run_remote_session`.
+/// Referenced by `WebState`, the audio output callback, and
+/// `spawn_interface_monitor`. All fields are cheaply `Arc::clone`-able.
+struct RemoteSessionHandles {
+    socket:                Arc<UdpSocket>,
+    handshake_connected:   Arc<AtomicBool>,
+    last_control_ms:       Arc<AtomicU64>,
+    last_audio_ms:         Arc<AtomicU64>,
+    remote_channels:       Arc<AtomicUsize>,
+    remote_metadata:       Arc<Mutex<Option<RemoteMetadata>>>,
+    remote_conflict:       Arc<Mutex<Option<String>>>,
+    rtt_us10:              Arc<AtomicU32>,
+    established_peer_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
+    receive_reset_epoch:   Arc<AtomicU64>,
+    // Shared with the output callback:
+    started:               Arc<AtomicBool>,
+    flush_samples:         Arc<AtomicUsize>,
+    empty_cb:              Arc<AtomicU32>,
+    output_ok:             Arc<AtomicBool>,
+    underflows:            Arc<AtomicUsize>,
+    channels_to_send:      Vec<usize>,
+    /// Adaptive phase-lock timeout in ms — updated from measured p95 jitter.
+    #[allow(dead_code)] // read by recv thread via Arc
+    phase_lock_timeout_ms: Arc<AtomicU64>,
+}
+
+/// Spawn all per-remote network threads: UDP socket, handshake/keepalive,
+/// optional rendezvous, and (when `cfg.recv_enabled`) the receive/decode thread.
+///
+/// Returns `RemoteSessionHandles` so the caller can wire the output callback
+/// and `WebState` without depending on the thread internals.
+///
+/// `pb_prods` — one playback ring buffer producer per `MAX_CHANNELS` slot,
+/// pre-allocated by the caller. Moved into the receive thread. Ignored (but
+/// still consumed) when `cfg.recv_enabled` is false — the caller should not
+/// pass `Some` in that case; a `None` or empty `Vec` is fine.
+#[allow(unused_assignments)]
+fn run_remote_session(
+    cfg: RemoteSessionConfig,
+    socket: Arc<UdpSocket>,
+    rx_packets: std::sync::mpsc::Receiver<(usize, std::net::SocketAddr, Vec<u8>)>,
+    pb_prods: Vec<ringbuf::HeapProd<f32>>,
+    meters:       Arc<MeterBank>,
+    ui_stats:     Arc<Mutex<UiStats>>,
+    local_labels: Arc<Mutex<Vec<String>>>,
+) -> Result<RemoteSessionHandles> {
+
+    // ── Unpack config into locals so thread closures capture them directly ────
+    // This means the thread bodies below are identical to the original — no
+    // changes to any logic, only to where the variables come from.
+    let num_channels   = cfg.num_channels;
+    let is_initiator   = cfg.is_initiator;
+    let shared_token   = cfg.shared_token;
+    let device_name_token = cfg.device_name_token;
+    let prime_samples  = cfg.prime_samples;
+    let jitter         = cfg.jitter;
+    let node_id        = cfg.node_id.clone();
+    let node_id_recv   = cfg.node_id.clone();
+    let rx_channel_offset = cfg.rx_channel_offset;
+
+    // Socket passed in from run_bidir.
 
     #[cfg(unix)]
     if matches!(std::env::var("AUDIOLINK_DSCP_EF").ok().as_deref(),
@@ -107,108 +187,27 @@ pub fn run_bidir(
         else { tracing::warn!("DSCP EF setsockopt failed: {}", std::io::Error::last_os_error()); }
     }
 
-    let established_addr:   Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
-    let punch_target:       Arc<Mutex<Option<std::net::SocketAddr>>> = Arc::new(Mutex::new(None));
+    // ── Per-session shared state ───────────────────────────────────────────────
+    let established_addr    = Arc::new(Mutex::new(None::<std::net::SocketAddr>));
+    let punch_target        = Arc::new(Mutex::new(None::<std::net::SocketAddr>));
     let receive_reset_epoch = Arc::new(AtomicU64::new(0));
     let handshake_connected = Arc::new(AtomicBool::new(false));
     let last_control_ms     = Arc::new(AtomicU64::new(0));
     let last_audio_ms       = Arc::new(AtomicU64::new(0));
     let remote_channels     = Arc::new(AtomicUsize::new(num_channels));
-    let remote_metadata     = Arc::new(Mutex::new(None));
-    let monitor_mode_atomic = Arc::new(AtomicU8::new(0u8)); // always PatchMatrix
-    let output_route_masks  = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
-    let tx_tone_source_for_send = Arc::new(
-        (0..MAX_CHANNELS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>()
-    );
-    let local_labels        = Arc::new(Mutex::new(load_persisted_labels(num_channels)));
-    let presets             = Arc::new(Mutex::new(HashMap::new()));
-    let mut initial_stats   = UiStats::default();
-    initial_stats.target_ms = jitter.target_delay_ms;
-    let ui_stats            = Arc::new(Mutex::new(initial_stats));
-    let meters              = Arc::new(MeterBank::new());
-    let devices             = Arc::new(scan_audio_devices_once());
-    let local_input_channels = devices.default_input_channels.min(MAX_CHANNELS);
-    let initial_routes      = load_persisted_routes(local_input_channels, num_channels);
-    apply_routes_to_masks(&initial_routes, &output_route_masks);
-    apply_routes_to_tx_sources(&initial_routes, &tx_tone_source_for_send);
-    let routes              = Arc::new(Mutex::new(initial_routes));
+    let remote_metadata     = Arc::new(Mutex::new(None::<RemoteMetadata>));
     let rtt_us10            = Arc::new(AtomicU32::new(0));
-    let remote_conflict: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let remote_conflict     = Arc::new(Mutex::new(None::<String>));
+    // Shared between recv thread and output callback:
+    let output_ok           = Arc::new(AtomicBool::new(true));
+    let phase_lock_timeout_ms = Arc::new(AtomicU64::new(crate::constants::PHASE_LOCK_TIMEOUT_MS));
+    let started             = Arc::new(AtomicBool::new(false));
+    let flush_samples       = Arc::new(AtomicUsize::new(0));
+    let empty_cb            = Arc::new(AtomicU32::new(0));
+    let underflows          = Arc::new(AtomicUsize::new(0));
+    let ring_overflows      = Arc::new(AtomicUsize::new(0));
 
-    let web_state = WebState {
-        started_at: Instant::now(),
-        node_id: node_id.clone(),
-        local_channels: num_channels,
-        local_input_channels,
-        send_enabled, recv_enabled,
-        handshake_connected: Arc::clone(&handshake_connected),
-        last_control_ms: Arc::clone(&last_control_ms),
-        last_audio_ms: Arc::clone(&last_audio_ms),
-        remote_channels: Arc::clone(&remote_channels),
-        remote_metadata: Arc::clone(&remote_metadata),
-        monitor_mode: Arc::clone(&monitor_mode_atomic),
-        output_route_masks: Arc::clone(&output_route_masks),
-        tx_tone_source_for_send: Arc::clone(&tx_tone_source_for_send),
-        local_labels: Arc::clone(&local_labels),
-        metadata_socket: Arc::clone(&socket),
-        device_name_token,
-        routes: Arc::clone(&routes),
-        presets: Arc::clone(&presets),
-        stats: Arc::clone(&ui_stats),
-        meters: Arc::clone(&meters),
-        runtime: RuntimeSummary {
-            mode: if is_initiator { "bidirectional".into() } else { "bidirectional-responder".into() },
-            remote_host: if is_initiator { remote_addr_str.clone() } else { String::new() },
-            remote_device_name: remote_device_name.to_string(),
-            source: "Matrix".into(),
-            codec: "Opus".into(),
-            opus_bitrate_per_channel,
-            frame_ms: 20,
-            tx_channels: num_channels,
-            token_configured: true,
-            token_hint: token_to_hex(&shared_token),
-            token_hex: token_to_hex(&shared_token),
-            send_enabled, recv_enabled,
-            latency_ms: jitter.configured_delay_ms,
-            effective_latency_ms: jitter.target_delay_ms,
-            fixed_jitter: !jitter.adaptive,
-            phase_lock: jitter.phase_lock,
-            encoder_mode: encoder_mode.as_str().to_string(),
-            link_password_configured: load_persisted_state()
-                .config.link_password.map(|p| !p.is_empty()).unwrap_or(false),
-            rendezvous_url: rendezvous_url.clone().unwrap_or_default(),
-            bind_addr: bind_addr.clone(),
-            selected_input_device: selected_input_device.clone(),
-            selected_output_device: selected_output_device.clone(),
-            web_note: "Setup Apply performs a controlled process rebuild.".into(),
-        },
-        devices: Arc::clone(&devices),
-        restart_lock: Arc::new(Mutex::new(())),
-        established_peer_addr: Arc::clone(&established_addr),
-        rtt_us10: Arc::clone(&rtt_us10),
-        actual_input_rate: Arc::new(AtomicU32::new(0)),
-        actual_output_rate: Arc::new(AtomicU32::new(0)),
-        remote_conflict: Arc::clone(&remote_conflict),
-    };
-
-    // Extract Arc refs before web_state is moved into spawn_web_ui
-    let actual_input_rate  = Arc::clone(&web_state.actual_input_rate);
-    let actual_output_rate = Arc::clone(&web_state.actual_output_rate);
-    if let Some(addr) = web_addr { spawn_web_ui(addr, web_state); }
-
-    tracing::info!(
-        "Bidir: role={} remote_device={remote_device_name} remote_host={} \
-         channels={num_channels} send={send_enabled} recv={recv_enabled} id={node_id} \
-         bind={bind_addr} buffer={}ms effective={}ms adaptive={} phase_lock={} encoder={}",
-        if is_initiator { "initiator" } else { "responder" },
-        if is_initiator { &remote_addr_str } else { "<blank>" },
-        jitter.configured_delay_ms, jitter.target_delay_ms,
-        jitter.adaptive, jitter.phase_lock, encoder_mode.as_str()
-    );
-
-    spawn_interface_monitor(Arc::clone(&receive_reset_epoch), Arc::clone(&handshake_connected));
-
-    // ── Handshake / keepalive / staleness watchdog ──────────────────────────
+    // ── Handshake / keepalive / staleness watchdog ───────────────────────────
     {
         let socket_hs       = Arc::clone(&socket);
         let connected_hs    = Arc::clone(&handshake_connected);
@@ -218,7 +217,10 @@ pub fn run_bidir(
         let last_audio_hs   = Arc::clone(&last_audio_ms);
         let rtt_hs          = Arc::clone(&rtt_us10);
         let reset_epoch_hs  = Arc::clone(&receive_reset_epoch);
-        let remote_name_hs  = remote_device_name.to_string();
+        let remote_name_hs  = cfg.remote_device_name.clone();
+        let initial_remote_addr_hs: Option<std::net::SocketAddr> = if is_initiator {
+            format!("{}:{PORT}", cfg.remote_host).parse().ok()
+        } else { None };
         const STALE_MS: u64 = 15_000;
 
         std::thread::spawn(move || {
@@ -232,7 +234,6 @@ pub fn run_bidir(
                     if last_any > 0 && now_ms.saturating_sub(last_any) > STALE_MS {
                         tracing::warn!("Stale: no packet for {}ms — resetting", now_ms.saturating_sub(last_any));
                         if !is_initiator {
-                            udp_disconnect_socket(socket_hs.as_ref()).ok();
                             if let Ok(mut e) = established_hs.lock() { *e = None; }
                         }
                         connected_hs.store(false, Ordering::Relaxed);
@@ -245,30 +246,30 @@ pub fn run_bidir(
                     }
                 }
                 let connected = connected_hs.load(Ordering::Relaxed);
-                if is_initiator {
-                    socket_hs.send(&probe).ok();
-                    if connected { socket_hs.send(&build_rtt_ping(now_us())).ok(); }
-                } else if connected {
-                    socket_hs.send(&probe).ok();
-                    socket_hs.send(&build_rtt_ping(now_us())).ok();
-                } else {
-                    match punch_target_hs.lock().ok().and_then(|g| *g) {
-                        Some(addr) => { socket_hs.send_to(&probe, addr).ok(); }
-                        None => { tracing::trace!("Responder: waiting for {remote_name_hs}"); }
+                let send_target: Option<std::net::SocketAddr> =
+                    established_hs.lock().ok().and_then(|g| *g)
+                    .or_else(|| punch_target_hs.lock().ok().and_then(|g| *g))
+                    .or(initial_remote_addr_hs);
+                match send_target {
+                    Some(addr) => {
+                        socket_hs.send_to(&probe, addr).ok();
+                        if connected { socket_hs.send_to(&build_rtt_ping(now_us()), addr).ok(); }
                     }
+                    None => { tracing::trace!("Responder: waiting for {remote_name_hs}"); }
                 }
                 std::thread::sleep(Duration::from_millis(2130));
             }
         });
     }
 
-    // ── Rendezvous ─────────────────────────────────────────────────────────
-    if let Some(rdv_url) = rendezvous_url.clone().filter(|u| !u.trim().is_empty()) {
+    // ── Rendezvous ────────────────────────────────────────────────────────────
+    if let Some(rdv_url) = cfg.rendezvous_url.clone().filter(|u| !u.trim().is_empty()) {
         let rdv_base = {
             let u = rdv_url.trim_end_matches('/');
             if u.starts_with("http://") || u.starts_with("https://") { u.to_string() }
             else { format!("https://{u}") }
         };
+        let remote_device_name = cfg.remote_device_name.clone();
         let reg_body = serde_json::json!({ "name": node_id, "port": PORT }).to_string();
         let con_body = serde_json::json!({ "my_name": node_id, "remote_name": remote_device_name }).to_string();
         {
@@ -277,8 +278,8 @@ pub fn run_bidir(
             let punch_r  = Arc::clone(&punch_target);
             let estab_r  = Arc::clone(&established_addr);
             let conn_r   = Arc::clone(&handshake_connected);
-            let _node_r   = node_id.clone();
-            let remote_r = remote_device_name.to_string();
+            let _node_r  = node_id.clone();
+            let remote_r = remote_device_name.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(1500));
                 loop {
@@ -344,10 +345,9 @@ pub fn run_bidir(
                             }
                         }
                         Ok(resp) if resp.status() == 404 => {
-                            // 404 = node not registered yet or unknown; wait before retry
                             std::thread::sleep(Duration::from_secs(5));
                         }
-                        Ok(_) => {} // 204 = no events, reconnect immediately
+                        Ok(_) => {}
                         Err(e) => { tracing::warn!("rendezvous: events poll: {e}"); std::thread::sleep(Duration::from_secs(5)); }
                     }
                     std::thread::sleep(Duration::from_millis(200));
@@ -357,131 +357,36 @@ pub fn run_bidir(
         tracing::info!("M9 rendezvous: registered with {rdv_url} as {node_id}");
     }
 
-    let host = cpal::default_host();
-
-    // ── Audio hardware initialisation (runs before network starts) ────────────
-    // On Linux: suppress_alsa_stderr wraps all ALSA enumeration so the wall of
-    // "cannot connect to JACK/PulseAudio/OSS" messages from libasound doesn't
-    // flood the logs. Those messages are libasound probing virtual backends and
-    // are completely harmless — they go to stderr directly, bypassing tracing.
-    suppress_alsa_stderr(|| {
-        use cpal::traits::HostTrait;
-        let out_name = selected_output_device.as_deref()
-            .filter(|n| !n.is_empty())
-            .map(|n| n.to_string())
-            .or_else(|| host.default_output_device().and_then(|d| d.name().ok()));
-        let in_name = selected_input_device.as_deref()
-            .filter(|n| !n.is_empty())
-            .map(|n| n.to_string())
-            .or_else(|| host.default_input_device().and_then(|d| d.name().ok()));
-        if let Some(name) = out_name {
-            try_force_device_sample_rate(&name, SAMPLE_RATE);
-        }
-        if let Some(name) = in_name {
-            try_force_device_sample_rate(&name, SAMPLE_RATE);
-        }
-    });
-    // Small settle time for CoreAudio to apply the rate change before we
-    // open streams. 100ms is enough; the hardware switch is near-instant.
-    #[cfg(target_os = "macos")]
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Helper: find a device by name, falling back to the default.
-    // Used for both input and output selection.
-    let find_output_device = |preferred: &Option<String>| -> Option<cpal::Device> {
-        if let Some(name) = preferred.as_deref().filter(|n| !n.is_empty()) {
-            if let Ok(mut devs) = host.output_devices() {
-                if let Some(d) = devs.find(|d| d.name().ok().as_deref() == Some(name)) {
-                    tracing::info!("Output: using selected device '{name}'");
-                    return Some(d);
-                }
-                tracing::warn!("Output device '{name}' not found — falling back to default");
-            }
-        }
-        host.default_output_device()
-    };
-    let find_input_device = |preferred: &Option<String>| -> Option<cpal::Device> {
-        if let Some(name) = preferred.as_deref().filter(|n| !n.is_empty()) {
-            if let Ok(mut devs) = host.input_devices() {
-                if let Some(d) = devs.find(|d| d.name().ok().as_deref() == Some(name)) {
-                    tracing::info!("Input: using selected device '{name}'");
-                    return Some(d);
-                }
-                tracing::warn!("Input device '{name}' not found — falling back to default");
-            }
-        }
-        host.default_input_device()
-    };
-
-    // input_ok: declared here so it's in scope for both recv and send pipelines
-    let input_ok     = Arc::new(AtomicBool::new(true));
-    let input_ok_err = Arc::clone(&input_ok);
-
-    // ── Receive / playback pipeline ─────────────────────────────────────────
-    let _out_stream: Option<cpal::Stream> = if recv_enabled {
-        let out_device = suppress_alsa_stderr(|| find_output_device(&selected_output_device))
-            .ok_or_else(|| anyhow!("No output device"))?;
-        let (out_config, out_device_rate) = suppress_alsa_stderr(|| best_output_config(&out_device, 2));
-        tracing::info!("Output: {} @ {}Hz stereo{}",
-            out_device.name().unwrap_or_default(),
-            out_device_rate,
-            if out_device_rate != SAMPLE_RATE { " (resampling from 48kHz)" } else { "" });
-        actual_output_rate.store(out_device_rate, Ordering::Relaxed);
-
-        let prime_samples = ((jitter.target_delay_ms as usize * SAMPLE_RATE as usize) / 1000)
-            .max(PRIME_SAMPLES);
-        let ring_samples = (prime_samples * 2).max(PB_RING_SIZE);
-
-        let mut pb_prods = Vec::with_capacity(MAX_CHANNELS);
-        let mut pb_conss = Vec::with_capacity(MAX_CHANNELS);
-        for _ in 0..MAX_CHANNELS {
-            let (prod, cons) = HeapRb::<f32>::new(ring_samples).split();
-            pb_prods.push(prod); pb_conss.push(cons);
-        }
-
-
-
-        let output_ok      = Arc::new(AtomicBool::new(true));
-        let output_ok_play = Arc::clone(&output_ok);
-        let output_ok_recv = Arc::clone(&output_ok);
-        let started        = Arc::new(AtomicBool::new(false));
-        let started_recv   = Arc::clone(&started);
-        let started_play   = Arc::clone(&started);
-        let flush_samples  = Arc::new(AtomicUsize::new(0));
-        let flush_recv     = Arc::clone(&flush_samples);
-        let flush_play     = Arc::clone(&flush_samples);
-        let empty_cb       = Arc::new(AtomicU32::new(0));
-        let empty_cb_play  = Arc::clone(&empty_cb);
-        let empty_cb_recv  = Arc::clone(&empty_cb);
-        let underflows     = Arc::new(AtomicUsize::new(0));
-        let underflows_recv = Arc::clone(&underflows);
-        let underflows_play = Arc::clone(&underflows);
-
+    // ── Receive / decode thread ───────────────────────────────────────────────
+    // Only spawned when recv_enabled. The Arc clones below use the same names as
+    // the original code so the thread body is byte-for-byte identical.
+    if cfg.recv_enabled {
         let socket_recv          = Arc::clone(&socket);
         let connected_recv       = Arc::clone(&handshake_connected);
-        let connected_play       = Arc::clone(&handshake_connected);
         let last_ctrl_recv       = Arc::clone(&last_control_ms);
         let last_audio_recv      = Arc::clone(&last_audio_ms);
         let remote_ch_recv       = Arc::clone(&remote_channels);
-        let remote_ch_play       = Arc::clone(&remote_channels);
         let remote_meta_recv     = Arc::clone(&remote_metadata);
-        let route_masks_play     = Arc::clone(&output_route_masks);
-        let meters_play          = Arc::clone(&meters);
         let meters_recv          = Arc::clone(&meters);
         let ui_stats_recv        = Arc::clone(&ui_stats);
         let local_labels_recv    = Arc::clone(&local_labels);
-        let node_id_recv         = node_id.clone();
         let rtt_recv             = Arc::clone(&rtt_us10);
         let conflict_recv        = Arc::clone(&remote_conflict);
         let estab_recv           = Arc::clone(&established_addr);
         let punch_recv           = Arc::clone(&punch_target);
         let reset_epoch_recv     = Arc::clone(&receive_reset_epoch);
-        let ring_overflows_recv  = Arc::new(AtomicUsize::new(0));
-        let _ring_overflows_play  = Arc::clone(&ring_overflows_recv);
+        let ring_overflows_recv  = Arc::clone(&ring_overflows);
+        let phase_lock_timeout_recv = Arc::clone(&phase_lock_timeout_ms);
+        let output_ok_recv       = Arc::clone(&output_ok);
+        let started_recv         = Arc::clone(&started);
+        let flush_recv           = Arc::clone(&flush_samples);
+        let empty_cb_recv        = Arc::clone(&empty_cb);
+        let underflows_recv      = Arc::clone(&underflows);
+        let mut pb_prods         = pb_prods;
+        let rx_packets_recv      = rx_packets;
 
         // Receive / decode thread
         std::thread::spawn(move || {
-            // Optional: try SCHED_FIFO for low-latency receive
             #[cfg(unix)]
             unsafe {
                 let mut p: libc::sched_param = std::mem::zeroed();
@@ -490,7 +395,6 @@ pub fn run_bidir(
                 if r != 0 { tracing::warn!("recv: SCHED_FIFO failed (errno {r}). Try: sudo setcap cap_sys_nice+eip ./audiolinkd"); }
                 else { tracing::info!("recv: SCHED_FIFO priority 20 active"); }
             }
-            socket_recv.set_read_timeout(Some(Duration::from_millis(1))).ok();
 
             let mut decoders    = fresh_opus_decoders();
             let mut resamplers  = fresh_asrc_resamplers();
@@ -529,7 +433,8 @@ pub fn run_bidir(
             let mut last_drained_ts: Option<u32> = None;
             let mut observed_epoch = reset_epoch_recv.load(Ordering::Relaxed);
 
-            macro_rules! reset_session {
+            #[allow(unused_assignments)]
+macro_rules! reset_session {
                 ($reason:expr, $clear_meta:expr) => {{
                     let active = remote_ch_recv.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
                     let old_fill = pb_prods[..active].iter().map(|p| p.occupied_len()).max().unwrap_or(0);
@@ -575,14 +480,11 @@ pub fn run_bidir(
                         if let Ok(mut c) = conflict_recv.lock() { if c.is_none() { *c = Some(src.to_string()); } }
                         false
                     }
-                    None => match socket_recv.connect(src) {
-                        Ok(()) => {
-                            tracing::info!("Responder: late-connected to {src}");
-                            *estab = Some(src);
-                            if let Ok(mut t) = punch_recv.lock() { *t = None; }
-                            true
-                        }
-                        Err(e) => { tracing::error!("Responder: late-connect to {src} failed: {e}"); false }
+                    None => {
+                        tracing::info!("Responder: late-connected to {src}");
+                        *estab = Some(src);
+                        if let Ok(mut t) = punch_recv.lock() { *t = None; }
+                        true
                     }
                 }
             };
@@ -594,22 +496,15 @@ pub fn run_bidir(
                     reset_session!("epoch/watchdog reset", true);
                 }
 
-                let result = if is_initiator {
-                    socket_recv.recv(&mut buf).map(|n| (n, None))
-                } else {
-                    socket_recv.recv_from(&mut buf).map(|(n, a)| (n, Some(a)))
-                };
-
-                match result {
-                    Ok((n, src)) => {
-                        // Reject packets from unknown source once established (responder)
+                match rx_packets_recv.recv_timeout(Duration::from_millis(1)) {
+                    Ok((n, src_addr, pkt_data)) => {
+                        buf[..n].copy_from_slice(&pkt_data[..n]);
+                        let src = Some(src_addr);
                         if !is_initiator {
-                            if let Some(src_addr) = src {
-                                if let Some(known) = estab_recv.lock().ok().and_then(|g| *g) {
-                                    if known != src_addr {
-                                        if let Ok(mut c) = conflict_recv.lock() { if c.is_none() { *c = Some(src_addr.to_string()); } }
-                                        continue;
-                                    }
+                            if let Some(known) = estab_recv.lock().ok().and_then(|g| *g) {
+                                if known != src_addr {
+                                    if let Ok(mut c) = conflict_recv.lock() { if c.is_none() { *c = Some(src_addr.to_string()); } }
+                                    continue;
                                 }
                             }
                         }
@@ -626,20 +521,20 @@ pub fn run_bidir(
                                         .unwrap_or_else(|| token_to_hex(&sender_token));
                                     let already = connected_recv.load(Ordering::Relaxed);
                                     if !already {
-                                        socket_recv.send(&build_accept_packet(&shared_token)).ok();
-                                        socket_recv.send(&build_confirm_packet(&shared_token)).ok();
+                                        socket_recv.send_to(&build_accept_packet(&shared_token), src_addr).ok();
+                                        socket_recv.send_to(&build_confirm_packet(&shared_token), src_addr).ok();
                                         let labels = local_labels_recv.lock()
                                             .map(|l| l.clone())
                                             .unwrap_or_else(|_| (0..num_channels).map(local_channel_label).collect());
-                                        socket_recv.send(&build_metadata_packet_with_labels(
-                                            &device_name_token, num_channels, &node_id_recv, &labels)).ok();
+                                        socket_recv.send_to(&build_metadata_packet_with_labels(
+                                            &device_name_token, num_channels, &node_id_recv, &labels), src_addr).ok();
                                         connected_recv.store(true, Ordering::Relaxed);
                                         reset_session!("new handshake", true);
                                         tracing::info!("HS: probe from {sender_name} — sent accept/confirm/metadata");
                                         if let Ok(mut c) = conflict_recv.lock() { *c = None; }
                                     } else {
                                         // Keepalive: CONFIRM only (wire-confirmed correct)
-                                        socket_recv.send(&build_confirm_packet(&shared_token)).ok();
+                                        socket_recv.send_to(&build_confirm_packet(&shared_token), src_addr).ok();
                                         tracing::trace!("Keepalive probe from {sender_name} — sent confirm");
                                     }
                                 }
@@ -649,9 +544,9 @@ pub fn run_bidir(
                                     let labels = local_labels_recv.lock()
                                         .map(|l| l.clone())
                                         .unwrap_or_else(|_| (0..num_channels).map(local_channel_label).collect());
-                                    socket_recv.send(&build_confirm_packet(&shared_token)).ok();
-                                    socket_recv.send(&build_metadata_packet_with_labels(
-                                        &device_name_token, num_channels, &node_id_recv, &labels)).ok();
+                                    socket_recv.send_to(&build_confirm_packet(&shared_token), src_addr).ok();
+                                    socket_recv.send_to(&build_metadata_packet_with_labels(
+                                        &device_name_token, num_channels, &node_id_recv, &labels), src_addr).ok();
                                     if !connected_recv.swap(true, Ordering::Relaxed) {
                                         reset_session!("accepted", true);
                                         tracing::info!("HS: accept received — sent confirm/metadata");
@@ -686,7 +581,7 @@ pub fn run_bidir(
                                 HandshakePacket::RttPing { timestamp_us } => {
                                     if !connected_recv.load(Ordering::Relaxed) { continue; }
                                     last_ctrl_recv.store(now_millis(), Ordering::Relaxed);
-                                    socket_recv.send(&build_rtt_pong(timestamp_us)).ok();
+                                    socket_recv.send_to(&build_rtt_pong(timestamp_us), src_addr).ok();
                                 }
                                 HandshakePacket::RttPong { timestamp_us } => {
                                     if !connected_recv.load(Ordering::Relaxed) { continue; }
@@ -763,7 +658,7 @@ pub fn run_bidir(
                                 if rtp_timestamp_at_or_before(pkt.timestamp, hwm) { continue; }
                             }
                             let group = groups.entry(pkt.timestamp)
-                                .or_insert_with(|| FrameGroup::new(pkt.timestamp, active));
+                                .or_insert_with(|| FrameGroup::new(pkt.timestamp, active, phase_lock_timeout_recv.load(Ordering::Relaxed)));
                             group.insert(ch, pkt.opus_payload);
                         } else {
                             if last_ts_nonplc != Some(pkt.timestamp) {
@@ -783,27 +678,15 @@ pub fn run_bidir(
                                     ring_overflows_recv.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                            meters_recv.set_rx_peak(ch, peak_dbfs_from_peak(peak));
+                            meters_recv.set_rx_peak(rx_channel_offset + ch, peak_dbfs_from_peak(peak));
                         }
                         empty_cb_recv.store(0, Ordering::Relaxed);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                           || e.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                        if connected_recv.swap(false, Ordering::Relaxed) {
-                            tracing::info!("recv: remote gone (ECONNREFUSED)");
-                        }
-                        if !is_initiator {
-                            udp_disconnect_socket(socket_recv.as_ref()).ok();
-                            if let Ok(mut e) = estab_recv.lock() { *e = None; }
-                        }
-                        if started_recv.load(Ordering::Relaxed) { reset_session!("ECONNREFUSED", true); }
-                        last_ctrl_recv.store(0, Ordering::Relaxed);
-                        last_audio_recv.store(0, Ordering::Relaxed);
-                        rtt_recv.store(0, Ordering::Relaxed);
-                        std::thread::sleep(Duration::from_millis(100));
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        tracing::error!("recv: demux channel closed — exiting");
+                        break;
                     }
-                    Err(e) => { tracing::error!("recv: {e}"); }
                 }
 
                 let active = remote_ch_recv.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
@@ -827,7 +710,7 @@ pub fn run_bidir(
                                         ring_ov.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                                meters_d.set_rx_peak(ch, peak_dbfs_from_peak(peak));
+                                meters_d.set_rx_peak(rx_channel_offset + ch, peak_dbfs_from_peak(peak));
                             }
                         },
                     );
@@ -896,26 +779,465 @@ pub fn run_bidir(
                     } else { jitter_ms };
                     let rec_buf_ms = ((jitter_p95 * 4.0).ceil() as u32).clamp(80, 500);
                     let ppm = ((correction - 1.0) * 1_000_000.0).round() as isize;
+                    // Adaptive phase-lock timeout: clamp(p95 * 2, 10, 40) ms.
+                    // Doubles the p95 gives headroom for tail outliers; clamp
+                    // prevents runaway on noisy links or extremely low latency.
+                    let adaptive_timeout = (jitter_p95 * 2.0).ceil() as u64;
+                    let clamped_timeout  = adaptive_timeout.clamp(10, 40);
+                    phase_lock_timeout_recv.store(clamped_timeout, Ordering::Relaxed);
+
                     tracing::info!(
                         "RX ch={active} {:.3}Mbps loss={:.3}% p95={:.2}ms fill={}ms target={}ms fps={:.1} plc={} drift={}ppm rtt={:.1}ms ov={}",
                         rx_mbps, loss_pct, jitter_p95, fill_ms, jitter.target_delay_ms, rx_fps, plc_delta, ppm, rtt_ms, ov_delta
                     );
-                    if let Ok(mut s) = ui_stats_recv.lock() {
-                        s.channels = active; s.fill_ms = fill_ms;
-                        s.target_ms = jitter.target_delay_ms; s.phase_lock = jitter.phase_lock;
-                        s.queued_groups = groups.len(); s.decoded_fps = rx_fps;
-                        s.output_underflows = uf_delta; s.plc_channels = plc_delta;
-                        s.seq_missing = lost_delta; s.loss_percent = loss_pct;
-                        s.jitter_ms = jitter_ms; s.jitter_p95_ms = jitter_p95;
-                        s.recommended_buffer_ms = rec_buf_ms;
-                        s.latency_ms = fill_ms; s.rx_mbps = rx_mbps;
-                        s.drift_pressure_ppm = ppm; s.rtt_ms = rtt_ms;
-                        s.one_way_latency_ms = rtt_ms / 2.0; s.ring_overflows = ov_delta;
+                    // Only update shared stats when this session is actively
+                    // receiving. An idle/unconnected session must not overwrite
+                    // good stats written by a connected session.
+                    if rx_fps > 0.0 || connected_recv.load(Ordering::Relaxed) {
+                        if let Ok(mut s) = ui_stats_recv.lock() {
+                            s.channels = active; s.fill_ms = fill_ms;
+                            s.target_ms = jitter.target_delay_ms; s.phase_lock = jitter.phase_lock;
+                            s.queued_groups = groups.len(); s.decoded_fps = rx_fps;
+                            s.output_underflows = uf_delta; s.plc_channels = plc_delta;
+                            s.seq_missing = lost_delta; s.loss_percent = loss_pct;
+                            s.jitter_ms = jitter_ms; s.jitter_p95_ms = jitter_p95;
+                            s.recommended_buffer_ms = rec_buf_ms;
+                            s.latency_ms = fill_ms; s.rx_mbps = rx_mbps;
+                            s.drift_pressure_ppm = ppm; s.rtt_ms = rtt_ms;
+                            s.one_way_latency_ms = rtt_ms / 2.0; s.ring_overflows = ov_delta;
+                        }
                     }
                     last_stats = Instant::now();
                 }
             }
         });
+
+    }
+
+    Ok(RemoteSessionHandles {
+        socket:               Arc::clone(&socket),
+        handshake_connected:  Arc::clone(&handshake_connected),
+        last_control_ms:      Arc::clone(&last_control_ms),
+        last_audio_ms:        Arc::clone(&last_audio_ms),
+        remote_channels:      Arc::clone(&remote_channels),
+        remote_metadata:      Arc::clone(&remote_metadata),
+        remote_conflict:      Arc::clone(&remote_conflict),
+        rtt_us10:             Arc::clone(&rtt_us10),
+        established_peer_addr: Arc::clone(&established_addr),
+        receive_reset_epoch:  Arc::clone(&receive_reset_epoch),
+        started:              Arc::clone(&started),
+        flush_samples:        Arc::clone(&flush_samples),
+        empty_cb:             Arc::clone(&empty_cb),
+        output_ok:            Arc::clone(&output_ok),
+        underflows:           Arc::clone(&underflows),
+        channels_to_send:     cfg.channels_to_send.clone(),
+        phase_lock_timeout_ms: Arc::clone(&phase_lock_timeout_ms),
+    })
+}
+
+// ─── run_bidir ────────────────────────────────────────────────────────────────
+
+pub fn run_bidir(
+    remotes: Vec<crate::persistence::RemoteConnection>,
+    num_channels: usize,
+    send_enabled: bool,
+    recv_enabled: bool,
+    device_name_token: [u8; 16],
+    node_id: String,
+    jitter: JitterConfig,
+    web_addr: Option<String>,
+    opus_bitrate_per_channel: u32,
+    rendezvous_url: Option<String>,
+    encoder_mode: EncoderMode,
+    bind_addr: String,
+    selected_input_device: Option<String>,
+    selected_output_device: Option<String>,
+) -> Result<()> {
+    if num_channels == 0 || num_channels > MAX_CHANNELS {
+        return Err(anyhow!("Channel count must be 1–{MAX_CHANNELS}"));
+    }
+    // Enabled remotes only — disabled entries are ignored entirely.
+    let active_remotes: Vec<&crate::persistence::RemoteConnection> =
+        remotes.iter().filter(|r| r.enabled && !r.name.is_empty()).collect();
+    // Derive first-remote fields for WebState (Stage 6 will generalise this).
+    let first = active_remotes.first().copied();
+    let remote_host        = first.map(|r| r.ip_override.as_str()).unwrap_or("");
+    let remote_device_name = first.map(|r| r.name.as_str()).unwrap_or("");
+    let is_initiator       = !remote_host.trim().is_empty();
+    // Derive shared token for first remote — used for WebState display only.
+    let shared_token_display = if let Some(r) = first {
+        crate::packet::derive_link_token(&node_id, &r.name, r.password.as_deref())
+    } else {
+        DEFAULT_SHARED_TOKEN
+    };
+
+    // ── Shared non-session state ──────────────────────────────────────────────
+    let monitor_mode_atomic = Arc::new(AtomicU8::new(0u8));
+    let output_route_masks  = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let tx_tone_source_for_send = Arc::new(
+        (0..MAX_CHANNELS).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>()
+    );
+    let local_labels        = Arc::new(Mutex::new(load_persisted_labels(num_channels)));
+    let presets             = Arc::new(Mutex::new(HashMap::new()));
+    let mut initial_stats   = UiStats::default();
+    initial_stats.target_ms = jitter.target_delay_ms;
+    let ui_stats            = Arc::new(Mutex::new(initial_stats));
+    let meters              = Arc::new(MeterBank::new());
+    let devices             = Arc::new(scan_audio_devices_once());
+    let local_input_channels = devices.default_input_channels.min(MAX_CHANNELS);
+    let initial_routes      = load_persisted_routes(local_input_channels, num_channels);
+    apply_routes_to_masks(&initial_routes, &output_route_masks, num_channels);
+    apply_routes_to_tx_sources(&initial_routes, &tx_tone_source_for_send);
+    let routes              = Arc::new(Mutex::new(initial_routes));
+
+    // ── Shared UDP socket ────────────────────────────────────────────────────────
+    let socket = {
+        let mut sock = None;
+        let mut last_err = None;
+        for attempt in 0..10 {
+            match UdpSocket::bind(format!("{bind_addr}:{PORT}")) {
+                Ok(s) => { sock = Some(Arc::new(s)); break; }
+                Err(e) => {
+                    if attempt > 0 { tracing::warn!("Port {PORT} busy (attempt {}/10), retrying…", attempt + 1); }
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+        sock.ok_or_else(|| anyhow!("Could not bind {bind_addr}:{PORT}: {}", last_err.unwrap()))?
+    };
+    tracing::info!("Bound to {bind_addr}:{PORT}");
+
+    #[cfg(unix)]
+    if matches!(std::env::var("AUDIOLINK_DSCP_EF").ok().as_deref(),
+        Some("1"|"true"|"yes"|"on")) {
+        use std::os::unix::io::AsRawFd;
+        let tos: libc::c_int = 0xb8;
+        let rc = unsafe {
+            libc::setsockopt(socket.as_raw_fd(), libc::IPPROTO_IP, libc::IP_TOS,
+                &tos as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t)
+        };
+        if rc == 0 { tracing::info!("DSCP EF marking enabled"); }
+        else { tracing::warn!("DSCP EF setsockopt failed: {}", std::io::Error::last_os_error()); }
+    }
+
+    // ── Ring buffers ─────────────────────────────────────────────────────────────
+    // Flat pool of MAX_CHANNELS slots. Remote at index i uses slots
+    // [i * num_channels .. (i+1) * num_channels] via rx_channel_offset.
+    let prime_samples = ((jitter.target_delay_ms as usize * SAMPLE_RATE as usize) / 1000)
+        .max(PRIME_SAMPLES);
+    let ring_samples = (prime_samples * 2).max(PB_RING_SIZE);
+    let mut pb_prods_all: Vec<ringbuf::HeapProd<f32>> = Vec::with_capacity(MAX_CHANNELS);
+    let mut pb_conss: Vec<ringbuf::HeapCons<f32>>     = Vec::with_capacity(MAX_CHANNELS);
+    for _ in 0..MAX_CHANNELS {
+        let (prod, cons) = HeapRb::<f32>::new(ring_samples).split();
+        pb_prods_all.push(prod);
+        pb_conss.push(cons);
+    }
+
+    // ── Per-remote demux channels + sessions ─────────────────────────────────
+    socket.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    let mut demux_entries: Vec<DemuxEntry> = Vec::new();
+    let mut sessions:      Vec<RemoteSessionHandles> = Vec::new();
+
+    for (i, remote) in active_remotes.iter().enumerate() {
+        let remote_token = crate::packet::derive_link_token(
+            &node_id, &remote.name, remote.password.as_deref(),
+        );
+        let rx_offset = remote.index * num_channels;
+        // Validate offset won't exceed ring pool
+        if rx_offset + num_channels > MAX_CHANNELS {
+            tracing::warn!(
+                "Remote {} ({}) exceeds ring pool capacity — skipping",
+                i, remote.name
+            );
+            continue;
+        }
+        let (demux_tx, demux_rx) =
+            std::sync::mpsc::sync_channel::<(usize, std::net::SocketAddr, Vec<u8>)>(64);
+        demux_entries.push(DemuxEntry { shared_token: remote_token, tx: demux_tx });
+
+        // Hand producers for this remote's ring slots to the session.
+        // Drain from pb_prods_all: replace slots [rx_offset..rx_offset+num_channels]
+        // with dummy rings so indices stay stable, and collect the real producers.
+        let mut session_prods: Vec<ringbuf::HeapProd<f32>> = Vec::with_capacity(num_channels);
+        for slot in rx_offset..rx_offset + num_channels {
+            // Swap out real producer with a dummy (1-sample) ring so indices stay valid.
+            let (dummy_prod, _dummy_cons) = HeapRb::<f32>::new(1).split();
+            let real_prod = std::mem::replace(&mut pb_prods_all[slot], dummy_prod);
+            session_prods.push(real_prod);
+        }
+
+        let channels_to_send = if remote.channels_to_send.is_empty() {
+            (0..num_channels).collect()
+        } else {
+            remote.channels_to_send.clone()
+        };
+
+        let sess = run_remote_session(
+            RemoteSessionConfig {
+                remote_host:        remote.ip_override.clone(),
+                remote_device_name: remote.name.clone(),
+                is_initiator:       !remote.ip_override.trim().is_empty(),
+                shared_token:       remote_token,
+                device_name_token,
+                node_id:            node_id.clone(),
+                num_channels,
+                jitter:             jitter.clone(),
+                rendezvous_url:     rendezvous_url.clone(),
+                bind_addr:          bind_addr.clone(),
+                prime_samples,
+                recv_enabled,
+                channels_to_send,
+                rx_channel_offset:  rx_offset,
+            },
+            Arc::clone(&socket),
+            demux_rx,
+            session_prods,
+            Arc::clone(&meters),
+            Arc::clone(&ui_stats),
+            Arc::clone(&local_labels),
+        )?;
+        sessions.push(sess);
+    }
+
+    // Convenience: first session handle for WebState wiring (Stage 6 generalises this).
+    // all_sessions retains Arc-cloned handles for the output callback aggregation.
+    // No enabled remotes = passive mode: engine runs but won't connect to anyone.
+    // The UI stays up and the user can configure remotes via Setup.
+    if sessions.is_empty() {
+        tracing::info!("No enabled remotes — running in passive mode (awaiting inbound connections)");
+        // In passive mode we still need a minimal session for WebState.
+        // Spawn a single passive session with empty remote name.
+        let (demux_tx_passive, demux_rx_passive) =
+            std::sync::mpsc::sync_channel::<(usize, std::net::SocketAddr, Vec<u8>)>(64);
+        demux_entries.push(DemuxEntry { shared_token: DEFAULT_SHARED_TOKEN, tx: demux_tx_passive });
+        let mut passive_prods: Vec<ringbuf::HeapProd<f32>> = Vec::with_capacity(num_channels);
+        for slot in 0..num_channels {
+            let (dummy, _) = HeapRb::<f32>::new(1).split();
+            let real = std::mem::replace(&mut pb_prods_all[slot], dummy);
+            passive_prods.push(real);
+        }
+        let sess = run_remote_session(
+            RemoteSessionConfig {
+                remote_host: String::new(),
+                remote_device_name: String::new(),
+                is_initiator: false,
+                shared_token: DEFAULT_SHARED_TOKEN,
+                device_name_token,
+                node_id: node_id.clone(),
+                num_channels,
+                jitter: jitter.clone(),
+                rendezvous_url: rendezvous_url.clone(),
+                bind_addr: bind_addr.clone(),
+                prime_samples,
+                recv_enabled,
+                channels_to_send: (0..num_channels).collect(),
+                rx_channel_offset: 0,
+            },
+            Arc::clone(&socket),
+            demux_rx_passive,
+            passive_prods,
+            Arc::clone(&meters),
+            Arc::clone(&ui_stats),
+            Arc::clone(&local_labels),
+        )?;
+        sessions.push(sess);
+    }
+    // Demux entries are now complete (including any passive entry) — spawn demux.
+    spawn_packet_demux(Arc::clone(&socket), demux_entries);
+
+    // Total ring buffer slots in use = active_remotes.len() * num_channels.
+    // Shared with the output callback so it only iterates occupied slots.
+    let total_rx_slots = Arc::new(AtomicUsize::new(
+        active_remotes.len().max(1) * num_channels
+    ));
+
+    let all_sessions: Vec<RemoteSessionHandles> = sessions;
+    let session = &all_sessions[0];
+
+    let web_state = WebState {
+        started_at: Instant::now(),
+        node_id: node_id.clone(),
+        local_channels: num_channels,
+        local_input_channels,
+        send_enabled, recv_enabled,
+        handshake_connected: Arc::clone(&session.handshake_connected),
+        last_control_ms:     Arc::clone(&session.last_control_ms),
+        last_audio_ms:       Arc::clone(&session.last_audio_ms),
+        remote_channels:     Arc::clone(&session.remote_channels),
+        remote_metadata:     Arc::clone(&session.remote_metadata),
+        monitor_mode:        Arc::clone(&monitor_mode_atomic),
+        output_route_masks:  Arc::clone(&output_route_masks),
+        tx_tone_source_for_send: Arc::clone(&tx_tone_source_for_send),
+        local_labels:        Arc::clone(&local_labels),
+        metadata_socket:     Arc::clone(&session.socket),
+        device_name_token,
+        routes:              Arc::clone(&routes),
+        presets:             Arc::clone(&presets),
+        stats:               Arc::clone(&ui_stats),
+        meters:              Arc::clone(&meters),
+        runtime: RuntimeSummary {
+            mode: if is_initiator { "bidirectional".into() } else { "bidirectional-responder".into() },
+            remote_host: if is_initiator { format!("{remote_host}:{PORT}") } else { String::new() },
+            remote_device_name: remote_device_name.to_string(), // first remote
+            source: "Matrix".into(),
+            codec: "Opus".into(),
+            opus_bitrate_per_channel,
+            frame_ms: 20,
+            tx_channels: num_channels,
+            token_configured: true,
+            token_hint: token_to_hex(&shared_token_display),
+            token_hex: token_to_hex(&shared_token_display),
+            send_enabled, recv_enabled,
+            latency_ms: jitter.configured_delay_ms,
+            effective_latency_ms: jitter.target_delay_ms,
+            fixed_jitter: !jitter.adaptive,
+            phase_lock: jitter.phase_lock,
+            encoder_mode: encoder_mode.as_str().to_string(),
+            link_password_configured: load_persisted_state()
+                .config.remotes.first()
+                .and_then(|r| r.password.as_deref())
+                .map(|p| !p.is_empty())
+                .unwrap_or(false),
+            rendezvous_url: rendezvous_url.clone().unwrap_or_default(),
+            bind_addr: bind_addr.clone(),
+            selected_input_device: selected_input_device.clone(),
+            selected_output_device: selected_output_device.clone(),
+            web_note: "Setup Apply performs a controlled process rebuild.".into(),
+        },
+        devices:              Arc::clone(&devices),
+        restart_lock:         Arc::new(Mutex::new(())),
+        established_peer_addr: Arc::clone(&session.established_peer_addr),
+        rtt_us10:             Arc::clone(&session.rtt_us10),
+        actual_input_rate:    Arc::new(AtomicU32::new(0)),
+        actual_output_rate:   Arc::new(AtomicU32::new(0)),
+        remote_conflict:      Arc::clone(&session.remote_conflict),
+        remote_session_infos: all_sessions.iter().zip(active_remotes.iter()).map(|(sess, remote)| {
+            crate::state::RemoteSessionInfo {
+                remote_index:        remote.index,
+                remote_name:         remote.name.clone(),
+                ip_override:         remote.ip_override.clone(),
+                num_channels:        num_channels,
+                handshake_connected: Arc::clone(&sess.handshake_connected),
+                last_control_ms:     Arc::clone(&sess.last_control_ms),
+                last_audio_ms:       Arc::clone(&sess.last_audio_ms),
+                remote_channels:     Arc::clone(&sess.remote_channels),
+                remote_metadata:     Arc::clone(&sess.remote_metadata),
+                rtt_us10:            Arc::clone(&sess.rtt_us10),
+            }
+        }).collect(),
+    };
+
+    let actual_input_rate  = Arc::clone(&web_state.actual_input_rate);
+    let actual_output_rate = Arc::clone(&web_state.actual_output_rate);
+    if let Some(addr) = web_addr { spawn_web_ui(addr, web_state); }
+
+    tracing::info!(
+        "Bidir: role={} remote_device={remote_device_name} remote_host={} \
+         channels={num_channels} send={send_enabled} recv={recv_enabled} id={node_id} \
+         bind={bind_addr} buffer={}ms effective={}ms adaptive={} phase_lock={} encoder={}",
+        if is_initiator { "initiator" } else { "responder" },
+        if is_initiator { remote_host } else { "<blank>" },
+        jitter.configured_delay_ms, jitter.target_delay_ms,
+        jitter.adaptive, jitter.phase_lock, encoder_mode.as_str()
+    );
+
+    spawn_interface_monitor(
+        Arc::clone(&session.receive_reset_epoch),
+        Arc::clone(&session.handshake_connected),
+    );
+
+    let host = cpal::default_host();
+
+    // ── Audio hardware initialisation (runs before network starts) ────────────
+    // On Linux: suppress_alsa_stderr wraps all ALSA enumeration so the wall of
+    // "cannot connect to JACK/PulseAudio/OSS" messages from libasound doesn't
+    // flood the logs. Those messages are libasound probing virtual backends and
+    // are completely harmless — they go to stderr directly, bypassing tracing.
+    suppress_alsa_stderr(|| {
+        use cpal::traits::HostTrait;
+        let out_name = selected_output_device.as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
+            .or_else(|| host.default_output_device().and_then(|d| d.name().ok()));
+        let in_name = selected_input_device.as_deref()
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
+            .or_else(|| host.default_input_device().and_then(|d| d.name().ok()));
+        if let Some(name) = out_name {
+            try_force_device_sample_rate(&name, SAMPLE_RATE);
+        }
+        if let Some(name) = in_name {
+            try_force_device_sample_rate(&name, SAMPLE_RATE);
+        }
+    });
+    // Small settle time for CoreAudio to apply the rate change before we
+    // open streams. 100ms is enough; the hardware switch is near-instant.
+    #[cfg(target_os = "macos")]
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Helper: find a device by name, falling back to the default.
+    // Used for both input and output selection.
+    let find_output_device = |preferred: &Option<String>| -> Option<cpal::Device> {
+        if let Some(name) = preferred.as_deref().filter(|n| !n.is_empty()) {
+            if let Ok(mut devs) = host.output_devices() {
+                if let Some(d) = devs.find(|d| d.name().ok().as_deref() == Some(name)) {
+                    tracing::info!("Output: using selected device '{name}'");
+                    return Some(d);
+                }
+                tracing::warn!("Output device '{name}' not found — falling back to default");
+            }
+        }
+        host.default_output_device()
+    };
+    let find_input_device = |preferred: &Option<String>| -> Option<cpal::Device> {
+        if let Some(name) = preferred.as_deref().filter(|n| !n.is_empty()) {
+            if let Ok(mut devs) = host.input_devices() {
+                if let Some(d) = devs.find(|d| d.name().ok().as_deref() == Some(name)) {
+                    tracing::info!("Input: using selected device '{name}'");
+                    return Some(d);
+                }
+                tracing::warn!("Input device '{name}' not found — falling back to default");
+            }
+        }
+        host.default_input_device()
+    };
+
+    // input_ok: declared here so it's in scope for both recv and send pipelines
+    let input_ok     = Arc::new(AtomicBool::new(true));
+    let input_ok_err = Arc::clone(&input_ok);
+
+
+    // ── Receive / playback pipeline ─────────────────────────────────────────
+    let _out_stream: Option<cpal::Stream> = if recv_enabled {
+        let out_device = suppress_alsa_stderr(|| find_output_device(&selected_output_device))
+            .ok_or_else(|| anyhow!("No output device"))?;
+        let (out_config, out_device_rate) = suppress_alsa_stderr(|| best_output_config(&out_device, 2));
+        tracing::info!("Output: {} @ {}Hz stereo{}",
+            out_device.name().unwrap_or_default(),
+            out_device_rate,
+            if out_device_rate != SAMPLE_RATE { " (resampling from 48kHz)" } else { "" });
+        actual_output_rate.store(out_device_rate, Ordering::Relaxed);
+
+        // Wire session handles into names the output callback closure expects.
+        // connected_play / started_play: Vec across all sessions — output drains
+        // if ANY session is live, preventing buffer high from idle sessions.
+        let total_rx_slots_play = Arc::clone(&total_rx_slots);
+        let connected_play: Vec<Arc<AtomicBool>> = all_sessions.iter()
+            .map(|s| Arc::clone(&s.handshake_connected)).collect();
+        let started_play: Vec<Arc<AtomicBool>> = all_sessions.iter()
+            .map(|s| Arc::clone(&s.started)).collect();
+        // Dummy AtomicBool for handle_underrun (first session's started state).
+        let started_play_first = Arc::clone(&session.started);
+        let remote_ch_play   = Arc::clone(&session.remote_channels);
+        let flush_play       = Arc::clone(&session.flush_samples);
+        let empty_cb_play    = Arc::clone(&session.empty_cb);
+        let output_ok_play   = Arc::clone(&session.output_ok);
+        let underflows_play  = Arc::clone(&session.underflows);
+        let route_masks_play = Arc::clone(&output_route_masks);
+        let meters_play      = Arc::clone(&meters);
 
         // Output resampler: converts 48kHz frames to the device's native rate
         // when they differ (e.g. BT headphones that only do 44.1kHz).
@@ -961,9 +1283,11 @@ pub fn run_bidir(
                         // Need more: produce one 48kHz staging frame into out_staging_l/r.
                         // We reuse the full callback logic on a FRAME_SAMPLES-sized view.
                         // For brevity: fill with silence when not started.
-                        let active_r = remote_ch_play.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
-                        let playing_r = connected_play.load(Ordering::Relaxed)
-                            && started_play.load(Ordering::Relaxed);
+                        // Only iterate ring slots actually in use — avoids real-time
+                        // callback overload from iterating 64 empty slots.
+                        let active_r = total_rx_slots_play.load(Ordering::Relaxed).min(MAX_CHANNELS);
+                        let playing_r = connected_play.iter().any(|h| h.load(Ordering::Relaxed))
+                            && started_play.iter().any(|h| h.load(Ordering::Relaxed));
                         if !playing_r {
                             for s in out_carry.iter_mut() { *s = 0.0; }
                             data[pos..].fill(0.0);
@@ -1009,7 +1333,7 @@ pub fn run_bidir(
                 }
                 // ── Normal 48kHz path (no resampling needed) ──────────────────────────
                 let active = remote_ch_play.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
-                let playing = connected_play.load(Ordering::Relaxed) && started_play.load(Ordering::Relaxed);
+                let playing = connected_play.iter().any(|h| h.load(Ordering::Relaxed)) && started_play.iter().any(|h| h.load(Ordering::Relaxed));
                 if !playing {
                     let mut remaining = flush_play.load(Ordering::Relaxed);
                     if remaining > 0 {
@@ -1069,7 +1393,7 @@ pub fn run_bidir(
                 meters_play.set_monitor_peak(1, peak_dbfs_from_peak(mpeak[1]));
 
                 if underflowed { underflows_play.fetch_add(1, Ordering::Relaxed); }
-                handle_underrun(!any_sample, &started_play, &empty_cb_play);
+                handle_underrun(!any_sample, &started_play_first, &empty_cb_play);
             },
             move |e| {
                 if output_ok_play.swap(false, Ordering::Relaxed) {
@@ -1084,11 +1408,24 @@ pub fn run_bidir(
         tracing::info!("Receive disabled (--no-recv)");
         None
     };
-
     // ── Send pipeline ──────────────────────────────────────────────────────
     let _in_stream: Option<cpal::Stream> = if send_enabled {
-        let socket_tx    = Arc::clone(&socket);
-        let connected_tx = Arc::clone(&handshake_connected);
+        // ── Per-remote transmit handles ─────────────────────────────────────────
+        // Each entry carries: socket, connected flag, channels to transmit,
+        // and per-channel RTP sequence counters (sequence space is per-remote).
+        // For Stage 3b this is always one entry. Stage 4+ adds more.
+        struct RemoteTxHandle {
+            socket:           Arc<UdpSocket>,
+            connected:        Arc<AtomicBool>,
+            channels_to_send: Vec<usize>,
+            seqs:             Vec<u16>,
+        }
+        let mut remotes_tx = vec![RemoteTxHandle {
+            socket:           Arc::clone(&session.socket),
+            connected:        Arc::clone(&session.handshake_connected),
+            channels_to_send: session.channels_to_send.clone(),
+            seqs:             vec![0u16; num_channels],
+        }];
         let ui_stats_tx  = Arc::clone(&ui_stats);
         let meters_tx    = Arc::clone(&meters);
         let tx_masks     = Arc::clone(&tx_tone_source_for_send);
@@ -1192,11 +1529,12 @@ pub fn run_bidir(
                 .collect();
             tracing::info!("Send: {num_channels} encoder(s) — {} {}kb/s",
                 encoder_mode.as_str(), opus_bitrate_per_channel / 1000);
-            let mut seqs         = vec![0u16; num_channels];
+            let mut encoded_bufs: Vec<Vec<u8>> = vec![vec![0u8; 4000]; num_channels];
+            let mut encoded_lens: Vec<usize>   = vec![0usize; num_channels];
+            let mut compressed   = vec![0u8; 4000];
             let mut ts: u32      = 0;
             let mut abs_sample: u64 = 0;
             let mut frames       = vec![vec![0.0f32; FRAME_SAMPLES]; num_channels];
-            let mut compressed   = vec![0u8; 4000];
             let frame_dur        = Duration::from_micros(20_000);
             let mut next_dl      = Instant::now() + frame_dur;
             let mut sent_total:  u64   = 0;
@@ -1206,7 +1544,6 @@ pub fn run_bidir(
             let mut last_tx_log  = Instant::now();
 
             loop {
-                let connected = connected_tx.load(Ordering::Relaxed);
                 let frame_start = abs_sample;
                 let mut input_blocks = vec![vec![0.0f32; FRAME_SAMPLES]; in_channels];
                 if in_channels > 0 {
@@ -1249,13 +1586,23 @@ pub fn run_bidir(
                     if nsrc > 1 { let g = 1.0 / nsrc as f32; for s in frame.iter_mut() { *s *= g; } }
                     let peak = frame.iter().fold(0.0f32, |m,&v| m.max(v.abs()));
                     meters_tx.set_tx_peak(ch, peak_dbfs_from_peak(peak));
-                    if connected {
-                        if let Ok(n) = encoders[ch].encode_float(frame, &mut compressed) {
-                            let pkt = build_packet(seqs[ch], ts, ch as u8, &compressed[..n]);
-                            tx_bytes = tx_bytes.saturating_add(pkt.len());
-                            socket_tx.send(&pkt).ok();
-                        }
-                        seqs[ch] = seqs[ch].wrapping_add(1);
+                    let encoded_len = encoders[ch].encode_float(frame, &mut compressed).unwrap_or(0);
+                    encoded_bufs[ch][..encoded_len].copy_from_slice(&compressed[..encoded_len]);
+                    encoded_lens[ch] = encoded_len;
+                }
+
+                // Fan out: send only subscribed channels to each remote.
+                for remote in remotes_tx.iter_mut() {
+                    if !remote.connected.load(Ordering::Relaxed) { continue; }
+                    for &ch in &remote.channels_to_send {
+                        if ch >= num_channels || encoded_lens[ch] == 0 { continue; }
+                        let pkt = build_packet(
+                            remote.seqs[ch], ts, ch as u8,
+                            &encoded_bufs[ch][..encoded_lens[ch]],
+                        );
+                        tx_bytes = tx_bytes.saturating_add(pkt.len());
+                        remote.socket.send(&pkt).ok();
+                        remote.seqs[ch] = remote.seqs[ch].wrapping_add(1);
                     }
                 }
 

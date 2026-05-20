@@ -109,6 +109,7 @@ pub struct UiStats {
     pub tx_peak_dbfs: Vec<f32>,
     pub input_peak_dbfs: Vec<f32>,
     pub rx_peak_dbfs: Vec<f32>,
+    pub rx_lamp_dbfs: Vec<f32>,
     pub monitor_peak_dbfs: [f32; 2],
     pub rtt_ms: f64,
     pub one_way_latency_ms: f64,
@@ -130,6 +131,7 @@ pub struct RuntimeSummary {
     pub token_configured: bool,
     pub token_hint: String,
     #[serde(skip_serializing)]
+    #[allow(dead_code)]
     pub token_hex: String,
     pub send_enabled: bool,
     pub recv_enabled: bool,
@@ -164,8 +166,11 @@ pub struct DeviceResponse {
 // ─── MeterBank ───────────────────────────────────────────────────────────────
 
 pub struct MeterBank {
-    pub tx_peak_db_x100: Vec<AtomicI32>,
-    pub rx_peak_db_x100: Vec<AtomicI32>,
+    pub tx_peak_db_x100:    Vec<AtomicI32>,
+    pub rx_peak_db_x100:    Vec<AtomicI32>,
+    /// Fast-decay version of rx peaks used for signal-presence lamps.
+    /// LAMP_DECAY_X100 = 600 → ~250ms to decay from -18 to -90dBFS.
+    pub rx_lamp_db_x100:    Vec<AtomicI32>,
     pub input_peak_db_x100: Vec<AtomicI32>,
     pub monitor_peak_db_x100: [AtomicI32; 2],
 }
@@ -175,28 +180,45 @@ impl MeterBank {
         Self {
             tx_peak_db_x100:    (0..MAX_CHANNELS).map(|_| AtomicI32::new(-12000)).collect(),
             rx_peak_db_x100:    (0..MAX_CHANNELS).map(|_| AtomicI32::new(-12000)).collect(),
+            rx_lamp_db_x100:    (0..MAX_CHANNELS).map(|_| AtomicI32::new(-12000)).collect(),
             input_peak_db_x100: (0..MAX_CHANNELS).map(|_| AtomicI32::new(-12000)).collect(),
             monitor_peak_db_x100: [AtomicI32::new(-12000), AtomicI32::new(-12000)],
         }
     }
+    /// Decay rate: 1dB per call. At ~50 calls/sec ≈ 50dB/sec falloff.
+    /// Gives PPM-style ~1.4s release from -18dBFS to -90dBFS.
+    const DECAY_X100: i32 = 100;
+
+    #[inline]
+    fn peak_hold_update(slot: &AtomicI32, new_db_x100: i32) {
+        let old = slot.load(Ordering::Relaxed);
+        let held = if new_db_x100 >= old { new_db_x100 } else { (old - Self::DECAY_X100).max(new_db_x100) };
+        slot.store(held, Ordering::Relaxed);
+    }
+
     pub fn set_tx_peak(&self, ch: usize, db: f32) {
         if ch < self.tx_peak_db_x100.len() {
-            self.tx_peak_db_x100[ch].store((db * 100.0).round() as i32, Ordering::Relaxed);
+            Self::peak_hold_update(&self.tx_peak_db_x100[ch], (db * 100.0).round() as i32);
         }
     }
     pub fn set_rx_peak(&self, ch: usize, db: f32) {
         if ch < self.rx_peak_db_x100.len() {
-            self.rx_peak_db_x100[ch].store((db * 100.0).round() as i32, Ordering::Relaxed);
+            let v = (db * 100.0).round() as i32;
+            Self::peak_hold_update(&self.rx_peak_db_x100[ch], v);
+            // Fast-decay lamp value: 6dB/call ≈ 300dB/sec → ~250ms release
+            let old = self.rx_lamp_db_x100[ch].load(Ordering::Relaxed);
+            let lamp = if v >= old { v } else { (old - 600).max(v) };
+            self.rx_lamp_db_x100[ch].store(lamp, Ordering::Relaxed);
         }
     }
     pub fn set_input_peak(&self, ch: usize, db: f32) {
         if ch < self.input_peak_db_x100.len() {
-            self.input_peak_db_x100[ch].store((db * 100.0).round() as i32, Ordering::Relaxed);
+            Self::peak_hold_update(&self.input_peak_db_x100[ch], (db * 100.0).round() as i32);
         }
     }
     pub fn set_monitor_peak(&self, side: usize, db: f32) {
         if side < 2 {
-            self.monitor_peak_db_x100[side].store((db * 100.0).round() as i32, Ordering::Relaxed);
+            Self::peak_hold_update(&self.monitor_peak_db_x100[side], (db * 100.0).round() as i32);
         }
     }
     pub fn snapshot_tx(&self, n: usize) -> Vec<f32> {
@@ -204,6 +226,9 @@ impl MeterBank {
     }
     pub fn snapshot_rx(&self, n: usize) -> Vec<f32> {
         self.rx_peak_db_x100.iter().take(n.min(MAX_CHANNELS)).map(|v| v.load(Ordering::Relaxed) as f32 / 100.0).collect()
+    }
+    pub fn snapshot_rx_lamp(&self, n: usize) -> Vec<f32> {
+        self.rx_lamp_db_x100.iter().take(n.min(MAX_CHANNELS)).map(|v| v.load(Ordering::Relaxed) as f32 / 100.0).collect()
     }
     pub fn snapshot_input(&self, n: usize) -> Vec<f32> {
         self.input_peak_db_x100.iter().take(n.min(MAX_CHANNELS)).map(|v| v.load(Ordering::Relaxed) as f32 / 100.0).collect()
@@ -242,39 +267,80 @@ pub struct WebState {
     pub stats: Arc<Mutex<UiStats>>,
     pub meters: Arc<MeterBank>,
     pub runtime: RuntimeSummary,
+    #[allow(dead_code)]
     pub devices: Arc<DeviceResponse>,
     pub restart_lock: Arc<Mutex<()>>,
     pub established_peer_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
+    #[allow(dead_code)] // used via RemoteSessionInfo
     pub rtt_us10: Arc<AtomicU32>,
     pub actual_input_rate: Arc<AtomicU32>,
     pub actual_output_rate: Arc<AtomicU32>,
     pub remote_conflict: Arc<Mutex<Option<String>>>,
+    /// Per-remote status handles — one entry per configured remote.
+    /// Index matches RemoteConnection.index. Used by stats and peers handlers.
+    pub remote_session_infos: Vec<RemoteSessionInfo>,
 }
 
-impl WebState {
-    pub fn peer_status(&self) -> PeerStatus {
+/// Lightweight per-remote status info, cloneable for web handlers.
+#[derive(Clone)]
+pub struct RemoteSessionInfo {
+    pub remote_index:       usize,
+    pub remote_name:        String,
+    pub ip_override:        String,
+    pub num_channels:       usize,
+    pub handshake_connected: Arc<AtomicBool>,
+    pub last_control_ms:    Arc<AtomicU64>,
+    pub last_audio_ms:      Arc<AtomicU64>,
+    pub remote_channels:    Arc<AtomicUsize>,
+    pub remote_metadata:    Arc<Mutex<Option<RemoteMetadata>>>,
+    pub rtt_us10:           Arc<AtomicU32>,
+}
+
+impl RemoteSessionInfo {
+    pub fn peer_status(&self, recv_enabled: bool) -> PeerStatus {
         let now_ms = now_millis();
         let last_control = self.last_control_ms.load(Ordering::Relaxed);
         let last_audio   = self.last_audio_ms.load(Ordering::Relaxed);
         let control_age_ms = now_ms.saturating_sub(last_control);
         let audio_age_ms   = now_ms.saturating_sub(last_audio);
-
         if !self.handshake_connected.load(Ordering::Relaxed) || last_control == 0 {
             return PeerStatus::Gray;
         }
         if control_age_ms > 5_000 { return PeerStatus::Gray; }
-        if self.recv_enabled
+        if recv_enabled
             && ((last_audio == 0 && control_age_ms > 1_000)
                 || (last_audio > 0 && audio_age_ms > 1_000))
         {
             return PeerStatus::Orange;
         }
-        if let Ok(stats) = self.stats.lock() {
-            if stats.output_underflows > 0 || stats.seq_missing > 0 {
-                return PeerStatus::Orange;
-            }
-        }
         PeerStatus::Green
+    }
+}
+
+impl WebState {
+    /// Aggregate peer status — Green if any remote is Green, Orange if any Orange, else Gray.
+    pub fn peer_status(&self) -> PeerStatus {
+        let statuses: Vec<PeerStatus> = self.remote_session_infos.iter()
+            .map(|r| r.peer_status(self.recv_enabled))
+            .collect();
+        if statuses.iter().any(|s| *s == PeerStatus::Green) { return PeerStatus::Green; }
+        if statuses.iter().any(|s| *s == PeerStatus::Orange) { return PeerStatus::Orange; }
+        // Fallback to legacy single-remote check for control_web_state (no session infos)
+        if self.remote_session_infos.is_empty() {
+            let now_ms = now_millis();
+            let last_control = self.last_control_ms.load(Ordering::Relaxed);
+            let last_audio   = self.last_audio_ms.load(Ordering::Relaxed);
+            let control_age_ms = now_ms.saturating_sub(last_control);
+            let audio_age_ms   = now_ms.saturating_sub(last_audio);
+            if !self.handshake_connected.load(Ordering::Relaxed) || last_control == 0 { return PeerStatus::Gray; }
+            if control_age_ms > 5_000 { return PeerStatus::Gray; }
+            if self.recv_enabled
+                && ((last_audio == 0 && control_age_ms > 1_000)
+                    || (last_audio > 0 && audio_age_ms > 1_000))
+            { return PeerStatus::Orange; }
+            return PeerStatus::Green;
+        }
+        PeerStatus::Gray
     }
 
     pub fn monitor_mode(&self) -> MonitorMode {

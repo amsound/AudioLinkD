@@ -195,11 +195,6 @@ pub fn build_metadata_packet_with_labels(
     pkt
 }
 
-pub fn build_metadata_packet(device_name_token: &[u8; 16], num_channels: usize, node_id: &str) -> Vec<u8> {
-    let labels: Vec<String> = (0..num_channels).map(local_channel_label).collect();
-    build_metadata_packet_with_labels(device_name_token, num_channels, node_id, &labels)
-}
-
 // ─── Metadata parsing ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

@@ -22,7 +22,7 @@ use crate::packet::{
     parse_token_arg, split_host_port, derive_link_token, derive_token_from_text,
 };
 use crate::persistence::{
-    load_persisted_state, save_persisted_config, save_persisted_routes,
+    load_persisted_state, save_persisted_routes,
     load_persisted_labels, PersistedRuntimeConfig,
 };
 use crate::routing::{
@@ -49,8 +49,10 @@ pub struct LocalLabelsRequest { pub labels: Vec<String> }
 
 #[derive(Debug, Deserialize)]
 pub struct SetupApplyRequest {
-    pub remote: String,
-    pub remote_device_name: String,
+    /// M13: full remotes list. Takes precedence over legacy single-remote fields.
+    #[serde(default)]
+    pub remotes: Vec<crate::persistence::RemoteConnection>,
+    #[allow(dead_code)]
     pub link_password: Option<String>,
     pub node_id: String,
     pub token: Option<String>,
@@ -85,6 +87,9 @@ pub struct StatusResponse {
     pub last_audio_age_ms: u64,
     pub remote_conflict: Option<String>,
     pub discovered_peer_addr: Option<String>,
+    /// Per-remote status array — empty in control_web_state (no engine).
+    #[serde(default)]
+    pub remotes: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,6 +125,34 @@ pub async fn status_handler(State(state): State<WebState>) -> Json<StatusRespons
         remote_conflict,
         discovered_peer_addr: state.established_peer_addr.lock().ok()
             .and_then(|g| *g).map(|a| a.ip().to_string()),
+        remotes: {
+            let stats_snap = state.stats.lock().map(|s| s.clone()).unwrap_or_default();
+            state.remote_session_infos.iter().map(|r| {
+                let peer_st = r.peer_status(state.recv_enabled);
+                let connected = peer_st != crate::state::PeerStatus::Gray;
+                let rtt_ms = r.rtt_us10.load(Ordering::Relaxed) as f64 / 10.0;
+                serde_json::json!({
+                    "index":       r.remote_index,
+                    "name":        r.remote_name,
+                    "ip_override": r.ip_override,
+                    "status":      peer_st,
+                    "channels":    if connected { r.remote_channels.load(Ordering::Relaxed) } else { 0 },
+                    "rtt_ms":      if connected { serde_json::json!(rtt_ms) } else { serde_json::Value::Null },
+                    "loss_percent": if connected { serde_json::json!(stats_snap.loss_percent) } else { serde_json::Value::Null },
+                    "jitter_ms":   if connected { serde_json::json!(stats_snap.jitter_ms) } else { serde_json::Value::Null },
+                    "fill_ms":     if connected { serde_json::json!(stats_snap.fill_ms) } else { serde_json::Value::Null },
+                    "target_ms":   if connected { serde_json::json!(stats_snap.target_ms) } else { serde_json::Value::Null },
+                    "drift_ppm":   if connected { serde_json::json!(stats_snap.drift_pressure_ppm) } else { serde_json::Value::Null },
+                    "decoded_fps": if connected { serde_json::json!(stats_snap.decoded_fps) } else { serde_json::Value::Null },
+                    "tx_fps":      if connected { serde_json::json!(stats_snap.tx_fps) } else { serde_json::Value::Null },
+                    "queued":      if connected { serde_json::json!(stats_snap.queued_groups) } else { serde_json::Value::Null },
+                    "plc_ch":      if connected { serde_json::json!(stats_snap.plc_channels) } else { serde_json::Value::Null },
+                    "seq_missing": if connected { serde_json::json!(stats_snap.seq_missing) } else { serde_json::Value::Null },
+                    "underflows":  if connected { serde_json::json!(stats_snap.output_underflows) } else { serde_json::Value::Null },
+                    "ring_overflows": if connected { serde_json::json!(stats_snap.ring_overflows) } else { serde_json::Value::Null },
+                })
+            }).collect::<Vec<_>>()
+        },
     })
 }
 
@@ -137,7 +170,7 @@ pub async fn routes_post_handler(
     if let Some(mode) = req.monitor_mode {
         state.monitor_mode.store(mode.as_u8(), Ordering::Relaxed);
     }
-    apply_routes_to_masks(&req.routes, &state.output_route_masks);
+    apply_routes_to_masks(&req.routes, &state.output_route_masks, state.local_channels);
     apply_routes_to_tx_sources(&req.routes, &state.tx_tone_source_for_send);
     if let Ok(mut routes) = state.routes.lock() {
         *routes = req.routes.clone();
@@ -167,12 +200,14 @@ pub async fn local_labels_post_handler(
     persisted.config.channel_labels = Some(labels.clone());
     crate::persistence::save_persisted_state(&persisted);
     if state.handshake_connected.load(Ordering::Relaxed) {
-        let pkt = build_metadata_packet_with_labels(
-            &state.device_name_token, state.local_channels, &state.node_id, &labels);
-        if let Err(e) = state.metadata_socket.send(&pkt) {
-            tracing::warn!("Metadata resend after label edit failed: {e}");
-        } else {
-            tracing::info!("Metadata: resent 09 0a after local channel label edit");
+        if let Some(addr) = state.established_peer_addr.lock().ok().and_then(|g| *g) {
+            let pkt = build_metadata_packet_with_labels(
+                &state.device_name_token, state.local_channels, &state.node_id, &labels);
+            if let Err(e) = state.metadata_socket.send_to(&pkt, addr) {
+                tracing::warn!("Metadata resend after label edit failed: {e}");
+            } else {
+                tracing::info!("Metadata: resent 09 0a after local channel label edit");
+            }
         }
     }
     Json(matrix_for_state(&state)).into_response()
@@ -192,7 +227,7 @@ pub async fn preset_recall_handler(
     let routes = state.presets.lock().ok().and_then(|p| p.get(&req.name).cloned());
     match routes {
         Some(routes) => {
-            apply_routes_to_masks(&routes, &state.output_route_masks);
+            apply_routes_to_masks(&routes, &state.output_route_masks, state.local_channels);
             apply_routes_to_tx_sources(&routes, &state.tx_tone_source_for_send);
             if let Ok(mut current) = state.routes.lock() {
                 *current = routes.clone(); save_persisted_routes(&current);
@@ -206,16 +241,22 @@ pub async fn preset_recall_handler(
 pub async fn setup_apply_handler(
     State(state): State<WebState>, Json(req): Json<SetupApplyRequest>,
 ) -> impl IntoResponse {
-    let remote              = req.remote.trim();
-    let remote_device_name  = req.remote_device_name.trim();
-    let node_id             = req.node_id.trim();
+    let node_id = req.node_id.trim();
     if node_id.is_empty() {
         return (StatusCode::BAD_REQUEST, "Device name is required").into_response();
     }
     if req.channels == 0 || req.channels > MAX_CHANNELS {
         return (StatusCode::BAD_REQUEST, format!("Network send channels must be 1-{MAX_CHANNELS}")).into_response();
     }
-    let link_password = req.link_password.as_deref().unwrap_or("").trim();
+
+    // Normalise remotes: prefer the M13 remotes list; fall back to legacy fields.
+    let remotes: Vec<crate::persistence::RemoteConnection> = req.remotes.clone();
+
+    // First remote drives token derivation and args (passive if none).
+    let first = remotes.iter().find(|r| r.enabled && !r.name.is_empty());
+    let remote_device_name = first.map(|r| r.name.as_str()).unwrap_or("");
+    let remote = first.map(|r| r.ip_override.as_str()).unwrap_or("");
+    let link_password = first.and_then(|r| r.password.as_deref()).unwrap_or("");
     let (token_hex, _token_derived) = if let Some(explicit) = req.token.as_deref().filter(|t| !t.trim().is_empty()) {
         match parse_token_arg(explicit.trim()) {
             Ok(token) => (token_to_hex(&token), false),
@@ -298,24 +339,53 @@ pub async fn setup_apply_handler(
         }
     }
 
-    save_persisted_config(PersistedRuntimeConfig {
-        remote: if remote.is_empty() { None } else { Some(split_host_port(remote)) },
-        remote_device_name: if remote_device_name.is_empty() { None } else { Some(remote_device_name.to_string()) },
-        link_password: if link_password.is_empty() { None } else { Some(link_password.to_string()) },
-        node_id: Some(node_id.to_string()),
-        token_hex: Some(token_hex.clone()),
-        channels: Some(req.channels),
-        opus_bitrate_per_channel: Some(req.opus_bitrate_per_channel),
-        latency_ms: Some(receive_buffer_ms),
-        fixed_jitter: Some(state.runtime.fixed_jitter),
-        phase_lock: Some(phase_lock),
-        encoder_mode: Some(encoder_mode),
-        channel_labels: None,
-        rendezvous_url: req.rendezvous_url.clone().filter(|u| !u.trim().is_empty()),
-        bind_addr: req.bind_addr.clone().filter(|a| !a.trim().is_empty() && a != "0.0.0.0"),
-        selected_input_device: req.selected_input_device.clone().filter(|d| !d.is_empty()),
-        selected_output_device: req.selected_output_device.clone().filter(|d| !d.is_empty()),
-    });
+    // Setup Apply always writes remotes explicitly — use direct state save so
+    // save_persisted_config's "preserve remotes if empty" logic doesn't fire.
+    // channel_labels are preserved from the existing state.
+    {
+        let mut saved_state = crate::persistence::load_persisted_state();
+
+        // Migrate stale routes when a remote's index changes but name stays the same.
+        {
+            let old_by_name: std::collections::HashMap<String, usize> =
+                saved_state.config.remotes.iter().map(|r| (r.name.clone(), r.index)).collect();
+            let new_by_name: std::collections::HashMap<String, usize> =
+                remotes.iter().map(|r| (r.name.clone(), r.index)).collect();
+            for (name, old_idx) in &old_by_name {
+                if let Some(&new_idx) = new_by_name.get(name) {
+                    if old_idx != &new_idx {
+                        let old_pfx = format!("peer:{}:ch:", old_idx);
+                        let new_pfx = format!("peer:{}:ch:", new_idx);
+                        for route in saved_state.routes.iter_mut() {
+                            if route.source.starts_with(&old_pfx) {
+                                route.source = route.source.replacen(&old_pfx, &new_pfx, 1);
+                            }
+                        }
+                        tracing::info!("Routes: migrated peer:{old_idx}:ch:* → peer:{new_idx}:ch:* for {name:?}");
+                    }
+                }
+            }
+        }
+
+        let preserved_labels = saved_state.config.channel_labels.clone();
+        saved_state.config = PersistedRuntimeConfig {
+            remotes: remotes.clone(),
+            node_id: Some(node_id.to_string()),
+            token_hex: Some(token_hex.clone()),
+            channels: Some(req.channels),
+            opus_bitrate_per_channel: Some(req.opus_bitrate_per_channel),
+            latency_ms: Some(receive_buffer_ms),
+            fixed_jitter: Some(state.runtime.fixed_jitter),
+            phase_lock: Some(phase_lock),
+            encoder_mode: Some(encoder_mode),
+            channel_labels: preserved_labels,
+            rendezvous_url: req.rendezvous_url.clone().filter(|u| !u.trim().is_empty()),
+            bind_addr: req.bind_addr.clone().filter(|a| !a.trim().is_empty() && a != "0.0.0.0"),
+            selected_input_device: req.selected_input_device.clone().filter(|d| !d.is_empty()),
+            selected_output_device: req.selected_output_device.clone().filter(|d| !d.is_empty()),
+        };
+        crate::persistence::save_persisted_state(&saved_state);
+    }
 
     let role = if remote.is_empty() { "responder" } else { "initiator" };
     tracing::warn!(
@@ -348,17 +418,40 @@ pub async fn setup_apply_handler(
 
 pub async fn stats_handler(State(state): State<WebState>) -> Json<UiStats> {
     let mut s = state.stats.lock().map(|s| s.clone()).unwrap_or_default();
-    let rx_n = state.remote_channels.load(Ordering::Relaxed).clamp(1, MAX_CHANNELS);
+    // Total rx slots = sum of all remotes' channel counts
+    let total_rx = state.remote_session_infos.iter()
+        .filter(|r| r.peer_status(state.recv_enabled) != crate::state::PeerStatus::Gray)
+        .map(|r| r.remote_channels.load(Ordering::Relaxed).min(r.num_channels))
+        .sum::<usize>()
+        .max(if state.remote_session_infos.is_empty() { state.remote_channels.load(Ordering::Relaxed) } else { 0 })
+        .clamp(0, MAX_CHANNELS);
     s.tx_peak_dbfs    = state.meters.snapshot_tx(state.local_channels);
     s.input_peak_dbfs = state.meters.snapshot_input(state.local_input_channels);
-    s.rx_peak_dbfs    = state.meters.snapshot_rx(rx_n);
+    s.rx_peak_dbfs    = state.meters.snapshot_rx(total_rx);
+    s.rx_lamp_dbfs    = state.meters.snapshot_rx_lamp(total_rx);
     s.monitor_peak_dbfs = state.meters.snapshot_monitor();
     Json(s)
 }
 
 pub async fn peers_handler(State(state): State<WebState>) -> Json<serde_json::Value> {
-    let metadata = state.remote_metadata.lock().ok().and_then(|m| m.clone());
-    Json(serde_json::json!([{ "id": "remote", "status": state.peer_status(), "metadata": metadata }]))
+    if state.remote_session_infos.is_empty() {
+        // control_web_state path — single legacy remote
+        let metadata = state.remote_metadata.lock().ok().and_then(|m| m.clone());
+        return Json(serde_json::json!([{ "id": "remote", "status": state.peer_status(), "metadata": metadata }]));
+    }
+    let peers: Vec<serde_json::Value> = state.remote_session_infos.iter().map(|r| {
+        let metadata = r.remote_metadata.lock().ok().and_then(|m| m.clone());
+        let rtt_ms = r.rtt_us10.load(Ordering::Relaxed) as f64 / 10.0;
+        serde_json::json!({
+            "id": format!("remote:{}", r.remote_index),
+            "index": r.remote_index,
+            "name": r.remote_name,
+            "status": r.peer_status(state.recv_enabled),
+            "metadata": metadata,
+            "rtt_ms": rtt_ms,
+        })
+    }).collect();
+    Json(serde_json::json!(peers))
 }
 
 pub async fn streams_handler(State(state): State<WebState>) -> Json<serde_json::Value> {
@@ -606,7 +699,7 @@ pub fn control_web_state(
     let devices             = Arc::new(scan_audio_devices_once());
     let local_input_channels = if devices.default_input_channels == 0 { 0 } else { devices.default_input_channels.min(MAX_CHANNELS) };
     let initial_routes      = load_persisted_routes(local_input_channels, send_channels);
-    apply_routes_to_masks(&initial_routes, &output_route_masks);
+    apply_routes_to_masks(&initial_routes, &output_route_masks, send_channels);
     apply_routes_to_tx_sources(&initial_routes, &tx_tone_source_for_send);
     let routes              = Arc::new(Mutex::new(initial_routes));
     let metadata_socket     = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
@@ -650,6 +743,7 @@ pub fn control_web_state(
         actual_input_rate: Arc::new(AtomicU32::new(0)),
         actual_output_rate: Arc::new(AtomicU32::new(0)),
         remote_conflict: Arc::new(Mutex::new(None)),
+        remote_session_infos: vec![],
     };
     spawn_control_only_metering(&state);
     Ok(state)
